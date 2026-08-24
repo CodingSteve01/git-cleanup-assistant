@@ -1,0 +1,104 @@
+name: Bump Homebrew formula
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, for example v0.2.0"
+        required: true
+
+permissions: {}
+
+env:
+  TAP_REPOSITORY: CodingSteve01/homebrew-tap
+  FORMULA_PATH: Formula/git-cleanup-assistant.rb
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve release and checksum
+        id: release
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "Unexpected tag '$TAG', expected something like v1.2.3." >&2; exit 1 ;;
+          esac
+
+          url="https://github.com/$SOURCE_REPOSITORY/archive/refs/tags/$TAG.tar.gz"
+
+          curl -fsSL --retry 3 -o release.tar.gz "$url"
+          sha="$(sha256sum release.tar.gz | cut -d ' ' -f 1)"
+
+          {
+            echo "version=${TAG#v}"
+            echo "url=$url"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the tap
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TAP_REPOSITORY }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Rewrite url and sha256
+        env:
+          FORMULA: tap/${{ env.FORMULA_PATH }}
+          URL: ${{ steps.release.outputs.url }}
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          test -f "$FORMULA" || { echo "Formula '$FORMULA' not found." >&2; exit 1; }
+
+          python3 - <<'PY'
+          import os
+          import re
+
+          path = os.environ["FORMULA"]
+          source = open(path, encoding="utf-8").read()
+
+          for field, value in (("url", os.environ["URL"]), ("sha256", os.environ["SHA"])):
+              pattern = rf'^(\s*{field}\s+)"[^"]*"$'
+              source, count = re.subn(
+                  pattern,
+                  lambda match: f'{match.group(1)}"{value}"',
+                  source,
+                  count=1,
+                  flags=re.MULTILINE,
+              )
+              if count != 1:
+                  raise SystemExit(f"Expected exactly one '{field}' line, replaced {count}.")
+
+          open(path, "w", encoding="utf-8").write(source)
+          PY
+
+          grep -q "\"$URL\"" "$FORMULA"
+          grep -q "\"$SHA\"" "$FORMULA"
+
+      - name: Commit and push
+        working-directory: tap
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet; then
+            echo "Formula is already at this version, nothing to do."
+            exit 0
+          fi
+
+          git config user.name "Steffen Lüling"
+          git config user.email "48046198+CodingSteve01@users.noreply.github.com"
+          git commit -am "git-cleanup-assistant $VERSION"
+          git push
