@@ -67,7 +67,7 @@ On startup it asks for two settings:
 
 ## Requirements
 
-- Git 2.30 or newer (`git worktree list --porcelain`)
+- Git 2.22 or newer (`git branch --show-current`)
 - [gum](https://github.com/charmbracelet/gum) for the interactive prompts
 - [GitHub CLI](https://cli.github.com) for pull request detection, authenticated via `gh auth login`
 
