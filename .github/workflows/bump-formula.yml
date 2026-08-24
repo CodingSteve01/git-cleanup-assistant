@@ -44,11 +44,20 @@ jobs:
             echo "sha=$sha"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Mint a short lived tap token
+        id: tap_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.TAP_BUMP_APP_ID }}
+          private-key: ${{ secrets.TAP_BUMP_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: homebrew-tap
+
       - name: Check out the tap
         uses: actions/checkout@v4
         with:
           repository: ${{ env.TAP_REPOSITORY }}
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          token: ${{ steps.tap_token.outputs.token }}
           path: tap
 
       - name: Rewrite url and sha256
@@ -86,10 +95,23 @@ jobs:
           grep -q "\"$URL\"" "$FORMULA"
           grep -q "\"$SHA\"" "$FORMULA"
 
+      - name: Resolve the bot identity
+        id: bot
+        env:
+          GH_TOKEN: ${{ steps.tap_token.outputs.token }}
+          BOT_SLUG: ${{ steps.tap_token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+
+          id="$(gh api "/users/$BOT_SLUG%5Bbot%5D" --jq .id)"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
       - name: Commit and push
         working-directory: tap
         env:
           VERSION: ${{ steps.release.outputs.version }}
+          BOT_NAME: ${{ steps.tap_token.outputs.app-slug }}[bot]
+          BOT_ID: ${{ steps.bot.outputs.id }}
         run: |
           set -euo pipefail
 
@@ -98,7 +120,7 @@ jobs:
             exit 0
           fi
 
-          git config user.name "Steffen Lüling"
-          git config user.email "48046198+CodingSteve01@users.noreply.github.com"
+          git config user.name "$BOT_NAME"
+          git config user.email "$BOT_ID+$BOT_NAME@users.noreply.github.com"
           git commit -am "git-cleanup-assistant $VERSION"
           git push
