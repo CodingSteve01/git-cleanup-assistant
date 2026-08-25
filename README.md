@@ -15,6 +15,7 @@ losing work you still need.
 - Multi-select with fuzzy search, so you can pick 20 branches in one pass
 - Guided cleanup that goes straight for the obvious candidates
 - Caches pull request metadata once per run instead of querying per branch
+- Bulk force deletion for branches Git will never call merged, gated behind an evidence table
 
 ## Safety rules
 
@@ -25,9 +26,26 @@ The whole point is that a bulk delete stays boring. These rules are enforced in 
 - Checked-out branches are never deleted
 - A `gone` upstream alone never triggers a forced branch deletion
 - Forced deletion is offered automatically only when GitHub confirms the pull request was merged
+- Every refusal and every skipped branch is reported with Git's own reason, so a run that
+  deletes nothing says why
+- Forcing a deletion in bulk needs a typed `DELETE` confirmation and prints the commit hash
+  of each deleted branch, so any of them can be restored with `git branch <name> <hash>`
 
 Without GitHub authentication the tool still works, it just falls back to what Git alone
 knows about merges.
+
+### Safe deletion in a squash-merge repository
+
+`git branch -d` calls a branch merged only when its commits are reachable from `HEAD`. A
+squash merge rewrites those commits, so every squash-merged branch stays "not fully merged"
+forever and safe deletion clears none of them. Two things follow:
+
+- Merge state is measured against the base ref you enter at startup, not against whatever
+  `HEAD` happens to be. Running the assistant from a worktree that sits on a feature branch
+  no longer makes Git refuse branches that were merged long ago.
+- Branches that a squash merge left behind are cleared through **Force delete selected
+  branches**, which shows the pull request state, the `gone` flag and the number of commits
+  that are not on the base ref for each branch before anything is deleted.
 
 ## Install
 
