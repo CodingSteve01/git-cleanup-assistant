@@ -25,12 +25,11 @@
 set -u
 
 #
-# The single source of truth for the released version. Raising it here and
-# merging to main is what publishes the tag, the GitHub release and the Homebrew
-# formula bump; see .github/workflows/release.yml. A merge that leaves it alone
-# releases nothing.
+# Written by release-please, which derives the next version from the Conventional
+# Commit subjects since the last tag. The trailing annotation is what tells it to
+# rewrite this line, so do not edit either by hand.
 #
-VERSION="0.2.0"
+VERSION="0.2.0" # x-release-please-version
 
 DEFAULT_STALE_DAYS=30
 DEFAULT_HEIGHT=24
