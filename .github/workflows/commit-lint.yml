@@ -1,0 +1,59 @@
+name: Commit lint
+
+#
+# squash_merge_commit_title is PR_TITLE and squash_merge_commit_message is BLANK,
+# so the pull request title is the only text that reaches main, and it is the
+# subject release-please parses. A title that does not parse fails nothing on its
+# own: it silently produces no release. That is the failure this repository has
+# already had, so the title is checked here, where it can still be edited.
+#
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+env:
+  # Pinned so a lint result never changes underneath an open pull request. There
+  # is no package.json here and a shell project should not grow one for a CI
+  # check, so commitlint is fetched per run rather than installed.
+  COMMITLINT_VERSION: 20.5.3
+
+jobs:
+  title:
+    name: Pull request title
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the configuration
+        uses: actions/checkout@v4
+
+      - name: Lint the title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s' "$TITLE" |
+            npx --yes \
+              -p "@commitlint/cli@$COMMITLINT_VERSION" \
+              -p "@commitlint/config-conventional@$COMMITLINT_VERSION" \
+              commitlint
+
+  commits:
+    name: Commits
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Lint the commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          npx --yes \
+            -p "@commitlint/cli@$COMMITLINT_VERSION" \
+            -p "@commitlint/config-conventional@$COMMITLINT_VERSION" \
+            commitlint --from "$BASE" --to "$HEAD"
