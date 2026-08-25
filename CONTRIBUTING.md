@@ -13,7 +13,9 @@ Bug reports and small, focused pull requests are welcome.
 - The safety rules in the README are the contract. A change that can delete a dirty
   worktree, a checked-out branch, or an unmerged branch without an explicit confirmation
   will not be merged.
-- No new runtime dependencies beyond `git`, `gum` and `gh`.
+- No new runtime dependencies beyond `git`, `gum` and `gh`. `gh` is optional and must stay
+  that way: a rung of the evidence ladder that only a forge can answer may refine a
+  classification, never be the only thing that produces one.
 - Portable shell only. The script runs under `bash` with `set -u`; keep it working with
   the `awk` and `date` that macOS ships, which are not the GNU versions. In particular,
   `awk` there rejects a line break directly after an opening parenthesis.

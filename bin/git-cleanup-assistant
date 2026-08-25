@@ -260,29 +260,57 @@ ensure_or_update_formula() {
     fi
 }
 
+#
+# gum draws the interface, so it is required. gh is not: every rung of the
+# evidence ladder that clears a branch on its own comes from git, so a run
+# without any forge still classifies branches. What a forge adds is knowing
+# whether a pull request is still open, which only refines "abandoned".
+#
 ensure_dependencies() {
-    # Nothing to bootstrap when both dependencies are already on PATH.
-    if command_exists gum && command_exists gh; then
+    if ! command_exists gum; then
+        if [[ "$(uname -s)" != "Darwin" ]]; then
+            die "Please install 'gum' first; automatic setup supports macOS only."
+        fi
+
+        ensure_homebrew
+        ensure_or_update_formula gum gum "Gum"
+    fi
+
+    if command_exists gh; then
+        # Keep an existing installation current, but never insist on one.
+        if command_exists brew; then
+            ensure_or_update_formula gh gh "GitHub CLI"
+        fi
+
         return
     fi
 
-    if [[ "$(uname -s)" != "Darwin" ]]; then
-        die "Please install 'gum' and 'gh' first; automatic setup supports macOS only."
+    if [[ "$(uname -s)" != "Darwin" ]] || ! command_exists brew; then
+        return
     fi
 
-    ensure_homebrew
+    echo "GitHub CLI is not installed. It is optional: it adds pull request"
+    echo "state to the branch list. Everything else works without it."
 
-    ensure_or_update_formula gum gum "Gum"
-    ensure_or_update_formula gh gh "GitHub CLI"
+    read -r -p "Install it now? [Y/n] " answer
+    answer="${answer:-y}"
+
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        brew install gh
+    fi
 }
 
 ensure_github_auth() {
+    GH_AVAILABLE=false
+
+    if ! command_exists gh; then
+        return
+    fi
+
     if gh auth status >/dev/null 2>&1; then
         GH_AVAILABLE=true
         return
     fi
-
-    GH_AVAILABLE=false
 
     title "GitHub Authentication"
 
@@ -706,6 +734,36 @@ branch_is_merged_into_base() {
     git merge-base --is-ancestor "$1" "$BASE_REF" >/dev/null 2>&1
 }
 
+#
+# Answers "was this branch squash-merged?" without asking any forge.
+#
+# A squash merge replaces the branch's commits with one new commit, so the tip is
+# never an ancestor of the base ref and every check based on ancestry says no,
+# forever. Rolling the branch into a single synthetic commit on top of the merge
+# base reproduces the patch the squash produced, and git cherry then finds it on
+# the base ref by patch id: a leading "-" means already applied.
+#
+# This is the strongest evidence available from git alone, which is what keeps
+# GitHub optional here rather than load bearing.
+#
+branch_is_patch_equivalent_to_base() {
+    local branch="$1"
+
+    local base
+    local tree
+    local synthetic
+
+    base="$(git merge-base "$BASE_REF" "$branch" 2>/dev/null)" || return 1
+    tree="$(git rev-parse "$branch^{tree}" 2>/dev/null)" || return 1
+
+    [[ -n "$base" && -n "$tree" ]] || return 1
+
+    # Writes one unreferenced commit object, which git gc collects.
+    synthetic="$(git commit-tree "$tree" -p "$base" -m _ 2>/dev/null)" || return 1
+
+    [[ "$(git cherry "$BASE_REF" "$synthetic" 2>/dev/null)" == -* ]]
+}
+
 scan_branches() {
     : > "$BRANCH_DATA"
 
@@ -724,6 +782,7 @@ scan_branches() {
             local gone=false
             local checked_out=false
             local git_merged=false
+            local squash_merged=false
             local pr_state
             local pr_number
             local pr_url
@@ -743,13 +802,23 @@ scan_branches() {
                 git_merged=true
             fi
 
+            #
+            # Only asked when ancestry already said no, and stored so the
+            # classification does not recompute it on every pass.
+            #
+            if [[ "$git_merged" != "true" ]] &&
+                branch_is_patch_equivalent_to_base "$branch"
+            then
+                squash_merged=true
+            fi
+
             pr_info="$(pr_info_for_branch "$branch")"
 
             IFS=$'\t' read -r pr_state pr_number pr_url <<EOF
 $pr_info
 EOF
 
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "B$(printf '%05d' "$index")" \
                 "$branch" \
                 "$date" \
@@ -762,6 +831,7 @@ EOF
                 "$pr_number" \
                 "$pr_url" \
                 "$epoch" \
+                "$squash_merged" \
                 >> "$BRANCH_DATA"
         done
 }
@@ -1261,6 +1331,19 @@ branch_display_rows() {
             checked=$7
             gitmerged=$8
             pr=$9
+            squashed=$13
+
+            #
+            # The same ladder classify_branch walks, minus the worktree rungs it
+            # cannot see from here. Both read the same fields, so a label in this
+            # list and the group in the plan can never disagree.
+            #
+            if (gitmerged == "true" || squashed == "true" || pr == "merged")
+                class = "MERGED"
+            else if (gone == "true" && pr != "open")
+                class = "ABANDONED"
+            else
+                class = "UNCLEAR"
 
             #
             # A branch a worktree has checked out is a candidate like any other
@@ -1270,11 +1353,9 @@ branch_display_rows() {
                 next
             }
 
-            printf "%s | %-6s | %-4s | %-6s | %-7s | %4sd | %s\n",
+            printf "%s | %-9s | %-7s | %4sd | %s\n",
                 id,
-                (pr == "merged" ? "MERGED" : "-"),
-                (gone == "true" ? "GONE" : "-"),
-                (gitmerged == "true" ? "GIT" : "-"),
+                class,
                 (checked == "true" ? "IN-WT" : "-"),
                 age,
                 branch
@@ -1298,7 +1379,7 @@ select_branches() {
         gum filter \
             --no-limit \
             --height "$LIST_HEIGHT" \
-            --header "Type MERGED, GONE, GIT or IN-WT to narrow. Tab selects, Enter confirms." \
+            --header "Type MERGED, ABANDONED, UNCLEAR or IN-WT to narrow. Tab selects, Enter confirms." \
             --placeholder "Filter branches..."
 }
 
@@ -1450,65 +1531,6 @@ remove_blocking_worktree() {
 }
 
 #
-# Answers what 'git branch -d' would answer, without running it: Git accepts a
-# branch that is reachable from HEAD or from its own upstream. Asking first is
-# what keeps the assistant from tearing down a worktree for a deletion that then
-# fails anyway.
-#
-branch_is_safely_deletable() {
-    local branch="$1"
-    local upstream
-
-    git merge-base --is-ancestor "$branch" HEAD 2>/dev/null && return 0
-
-    upstream="$(
-        git for-each-ref --format='%(upstream:short)' "refs/heads/$branch"
-    )"
-
-    [[ -n "$upstream" ]] || return 1
-
-    git merge-base --is-ancestor "$branch" "$upstream" 2>/dev/null
-}
-
-#
-# The deletion rule both passes share. Ancestry against BASE_REF licenses a
-# forced deletion; everything else has to survive Git's own check.
-#
-# Exit codes: 0 deleted, 2 refused as unmerged, 1 refused for any other reason.
-#
-delete_branch_under_policy() {
-    local id="$1"
-
-    local branch
-    local git_merged
-    local output
-
-    branch="$(branch_field "$id" 2)"
-    git_merged="$(branch_field "$id" 8)"
-
-    if [[ "$git_merged" == "true" ]]; then
-        if output="$(git branch -D "$branch" 2>&1)"; then
-            success "Deleted (merged into $BASE_REF): $branch"
-            return 0
-        fi
-
-        report_git_refusal "$branch" "$output"
-        return 1
-    fi
-
-    if output="$(git branch -d "$branch" 2>&1)"; then
-        success "Deleted: $branch"
-        return 0
-    fi
-
-    report_git_refusal "$branch" "$output"
-
-    [[ "$output" == *"not fully merged"* ]] && return 2
-
-    return 1
-}
-
-#
 # Second pass for the branches a worktree pinned during the bulk run. Keeping it
 # out of the main loop means a large selection still runs unattended and only
 # stops for the few that need a decision.
@@ -1519,13 +1541,15 @@ delete_branch_under_policy() {
 #
 force_delete_branch() {
     local branch="$1"
+    local reason="${2:-}"
+
     local hash
     local output
 
     hash="$(git rev-parse --short "$branch" 2>/dev/null || echo "?")"
 
     if output="$(git branch -D "$branch" 2>&1)"; then
-        success "Deleted: $branch (restore with 'git branch $branch $hash')"
+        success "Deleted${reason:+ ($reason)}: $branch  ·  restore: git branch $branch $hash"
         return 0
     fi
 
@@ -1534,28 +1558,36 @@ force_delete_branch() {
 }
 
 #
-# What the assistant knows about a branch, in the terms the user cares about.
+# The evidence ladder, strongest rung first.
 #
-#   PRIMARY  the primary worktree has it checked out; it always stays
-#   PROVEN   ancestry against BASE_REF or a merged pull request settles it
-#   SAFE     Git itself would accept the deletion
-#   FORCE    nothing proves it is merged; only a forced deletion removes it
+#   PRIMARY    the primary worktree has it checked out; it always stays
+#   PROVEN     the work is on the base ref: by ancestry, by patch equivalence
+#              after a squash merge, or by a merged pull request
+#   ABANDONED  the remote branch was deleted and no pull request is open. Not
+#              proof that the work landed, but a deliberate act by whoever
+#              deleted it, and carrying out that decision is what this tool is
+#              for
+#   UNKNOWN    no signal either way
 #
 # The suffix ":WT" means a worktree still has the branch checked out, so the
-# worktree has to go first whatever the class says.
+# worktree has to go first whatever the rung says.
 #
 classify_branch() {
     local id="$1"
 
     local branch
     local git_merged
+    local squash_merged
+    local gone
     local pr
     local path
     local class
 
     branch="$(branch_field "$id" 2)"
+    gone="$(branch_field "$id" 6)"
     git_merged="$(branch_field "$id" 8)"
     pr="$(branch_field "$id" 9)"
+    squash_merged="$(branch_field "$id" 13)"
     path="$(branch_worktree_path "$branch")"
 
     if [[ -n "$path" && "$path" == "$PRIMARY_WORKTREE" ]]; then
@@ -1563,12 +1595,15 @@ classify_branch() {
         return
     fi
 
-    if [[ "$git_merged" == "true" || "$pr" == "merged" ]]; then
+    if [[ "$git_merged" == "true" ||
+        "$squash_merged" == "true" ||
+        "$pr" == "merged" ]]
+    then
         class="PROVEN"
-    elif branch_is_safely_deletable "$branch"; then
-        class="SAFE"
+    elif [[ "$gone" == "true" && "$pr" != "open" ]]; then
+        class="ABANDONED"
     else
-        class="FORCE"
+        class="UNKNOWN"
     fi
 
     [[ -n "$path" ]] && class="$class:WT"
@@ -1621,107 +1656,121 @@ delete_selected_branches() {
     local ids="$1"
 
     local proven="$TMP_ROOT/plan-proven.txt"
-    local forced="$TMP_ROOT/plan-forced.txt"
+    local abandoned="$TMP_ROOT/plan-abandoned.txt"
+    local unknown="$TMP_ROOT/plan-unknown.txt"
     local kept="$TMP_ROOT/plan-kept.txt"
     local report="$TMP_ROOT/plan-evidence.txt"
 
     : > "$proven"
-    : > "$forced"
+    : > "$abandoned"
+    : > "$unknown"
     : > "$kept"
 
-    local blocked_proven=0
-    local blocked_forced=0
+    local blocked=0
 
     while IFS= read -r id; do
         [[ -z "$id" ]] && continue
 
-        case "$(classify_branch "$id")" in
-            PRIMARY)
-                echo "$id" >> "$kept"
-                ;;
-            PROVEN|SAFE)
-                echo "$id" >> "$proven"
-                ;;
-            PROVEN:WT|SAFE:WT)
-                echo "$id" >> "$proven"
-                blocked_proven=$((blocked_proven + 1))
-                ;;
-            FORCE)
-                echo "$id" >> "$forced"
-                ;;
-            FORCE:WT)
-                echo "$id" >> "$forced"
-                blocked_forced=$((blocked_forced + 1))
-                ;;
+        local class
+        class="$(classify_branch "$id")"
+
+        [[ "$class" == *:WT ]] && blocked=$((blocked + 1))
+
+        case "${class%:WT}" in
+            PRIMARY)   echo "$id" >> "$kept" ;;
+            PROVEN)    echo "$id" >> "$proven" ;;
+            ABANDONED) echo "$id" >> "$abandoned" ;;
+            UNKNOWN)   echo "$id" >> "$unknown" ;;
         esac
     done <<< "$ids"
 
     local proven_count
-    local forced_count
+    local abandoned_count
+    local unknown_count
     local kept_count
 
     proven_count=$(wc -l < "$proven" | tr -d ' ')
-    forced_count=$(wc -l < "$forced" | tr -d ' ')
+    abandoned_count=$(wc -l < "$abandoned" | tr -d ' ')
+    unknown_count=$(wc -l < "$unknown" | tr -d ' ')
     kept_count=$(wc -l < "$kept" | tr -d ' ')
+
+    local clearing=$((proven_count + abandoned_count))
 
     clear
     title "Deletion Plan"
 
     if [[ "$proven_count" -gt 0 ]]; then
-        echo "  ${GREEN}$proven_count${RESET} delete"
-        echo "      merged into $BASE_REF, confirmed by a merged pull request,"
-        echo "      or accepted by Git itself"
-
-        if [[ "$blocked_proven" -gt 0 ]]; then
-            echo "      $blocked_proven of them $(plural_verb "$blocked_proven") a worktree removed first"
-        fi
-
+        echo "  ${GREEN}$proven_count${RESET} merged"
+        echo "      already on $BASE_REF: by ancestry, by patch after a squash"
+        echo "      merge, or by a merged pull request"
         echo
     fi
 
-    if [[ "$forced_count" -gt 0 ]]; then
-        echo "  ${YELLOW}$forced_count${RESET} force delete"
-        echo "      nothing proves these are merged; confirmed separately"
+    if [[ "$abandoned_count" -gt 0 ]]; then
+        echo "  ${GREEN}$abandoned_count${RESET} abandoned"
+        echo "      the remote branch was deleted and no pull request is open"
+        echo
+    fi
 
-        if [[ "$blocked_forced" -gt 0 ]]; then
-            echo "      $blocked_forced of them $(plural_verb "$blocked_forced") a worktree removed first"
-        fi
-
+    if [[ "$unknown_count" -gt 0 ]]; then
+        echo "  ${YELLOW}$unknown_count${RESET} unclear"
+        echo "      no signal either way; confirmed separately"
         echo
     fi
 
     if [[ "$kept_count" -gt 0 ]]; then
-        echo "  ${CYAN}$kept_count${RESET} keep"
+        echo "  ${CYAN}$kept_count${RESET} kept"
         echo "      checked out in the primary worktree, which always stays"
         echo
     fi
 
-    if [[ "$proven_count" -eq 0 && "$forced_count" -eq 0 ]]; then
+    if [[ "$blocked" -gt 0 ]]; then
+        info "$blocked of these $(plural_verb "$blocked") a worktree removed first, confirmed one by one."
+        echo
+    fi
+
+    if [[ "$clearing" -eq 0 && "$unknown_count" -eq 0 ]]; then
         warning "Nothing in this selection can be deleted."
         gum input --placeholder "Press Enter to continue" >/dev/null
         return
     fi
 
-    if ! confirm "Run this plan?"; then
-        return
+    #
+    # One question for everything the ladder found evidence for. Asking once per
+    # group would only make the common case slower without saying anything the
+    # plan above has not already said.
+    #
+    if [[ "$clearing" -gt 0 ]]; then
+        echo "Deleting a branch drops the label, never the commits: the hash of"
+        echo "each one is printed, and it stays in the reflog."
+        echo
+
+        if confirm "Delete these $clearing branches?"; then
+            echo
+            run_confirmed_deletions "$proven" "merged"
+            run_confirmed_deletions "$abandoned" "abandoned"
+        else
+            info "Kept all $clearing."
+        fi
     fi
 
-    echo
-
-    if [[ "$proven_count" -gt 0 ]]; then
-        run_proven_deletions "$proven"
-    fi
-
-    if [[ "$forced_count" -gt 0 ]]; then
-        run_forced_deletions "$forced" "$report"
+    if [[ "$unknown_count" -gt 0 ]]; then
+        run_forced_deletions "$unknown" "$report"
     fi
 
     echo
     gum input --placeholder "Press Enter to continue" >/dev/null
 }
 
-run_proven_deletions() {
+#
+# Everything in these groups is already authorised by the plan's single
+# confirmation, so the safe deletion is not attempted first: git branch -d
+# refuses a squash-merged or abandoned tip by definition, and printing that
+# refusal only to override it reads like a failure.
+#
+run_confirmed_deletions() {
     local list="$1"
+    local reason="$2"
 
     while IFS= read -r id; do
         [[ -z "$id" ]] && continue
@@ -1730,7 +1779,7 @@ run_proven_deletions() {
         branch="$(branch_field "$id" 2)"
 
         remove_blocking_worktree "$branch" || continue
-        delete_branch_under_policy "$id"
+        force_delete_branch "$branch" "$reason"
     done < "$list"
 }
 
@@ -1916,6 +1965,37 @@ branch_menu() {
                 ;;
         esac
     done
+}
+
+# -----------------------------------------------------------------------------
+# One-shot cleanup
+# -----------------------------------------------------------------------------
+
+#
+# The whole tool in one action: every local branch goes through the evidence
+# ladder and the plan says what happens, with no list to work through first.
+# Picking twenty branches out of a filter one Tab at a time is the step that
+# stops a cleanup from happening at all.
+#
+# The manual paths stay for what this cannot answer: reviewing a single branch,
+# or going after something the ladder files under "unclear".
+#
+clean_up_now() {
+    refresh_repository_state
+
+    local ids
+    ids="$(cut -f1 "$BRANCH_DATA")"
+
+    if [[ -z "$ids" ]]; then
+        clear
+        title "Clean Up"
+        success "No local branches besides ${PRIMARY_BRANCH:-the primary branch}."
+        echo
+        gum input --placeholder "Press Enter to continue" >/dev/null
+        return
+    fi
+
+    delete_selected_branches "$ids"
 }
 
 # -----------------------------------------------------------------------------
@@ -2120,6 +2200,7 @@ while true; do
     action="$(
         menu \
             "What would you like to do?" \
+            "Clean up now" \
             "Guided cleanup" \
             "Worktrees" \
             "Local branches" \
@@ -2129,6 +2210,10 @@ while true; do
     )"
 
     case "$action" in
+        "Clean up now")
+            clean_up_now
+            ;;
+
         "Guided cleanup")
             guided_cleanup
             ;;
