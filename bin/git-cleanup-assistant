@@ -29,7 +29,7 @@ set -u
 # Commit subjects since the last tag. The trailing annotation is what tells it to
 # rewrite this line, so do not edit either by hand.
 #
-VERSION="0.2.0" # x-release-please-version
+VERSION="0.2.1" # x-release-please-version
 
 DEFAULT_STALE_DAYS=30
 DEFAULT_HEIGHT=24
