@@ -1400,68 +1400,279 @@ report_git_refusal() {
     printf '%s\n' "$output" | sed 's/^/    /'
 }
 
-safe_delete_branches() {
-    local ids="$1"
-    local deleted=0
-    local retained=0
-    local unmerged="$TMP_ROOT/unmerged-branches.txt"
+worktree_state() {
+    local path="$1"
 
-    : > "$unmerged"
+    if worktree_is_locked "$path"; then
+        echo "LOCKED"
+    elif worktree_is_dirty "$path"; then
+        echo "DIRTY"
+    else
+        echo "CLEAN"
+    fi
+}
+
+#
+# A branch that a worktree has checked out cannot be deleted at all, and no
+# amount of forcing changes that. Clearing the worktree is therefore part of
+# deleting the branch, not a separate errand in another menu.
+#
+# The state is read here rather than taken from the scan, because a worktree can
+# turn dirty between the scan and this prompt.
+#
+remove_blocking_worktree() {
+    local branch="$1"
+    local path
+    local state
+    local output
+
+    path="$(branch_worktree_path "$branch")"
+
+    [[ -z "$path" ]] && return 0
+
+    if [[ "$path" == "$PRIMARY_WORKTREE" ]]; then
+        warning "'$branch' is checked out in the primary worktree, which always stays."
+        return 1
+    fi
+
+    state="$(worktree_state "$path")"
+
+    echo
+    echo "${BOLD}$branch${RESET}"
+    echo "  Worktree: $path"
+    echo "  State:    $state"
+    echo
+
+    if [[ "$state" == "DIRTY" ]]; then
+        git -C "$path" status --short --ignore-submodules=none || true
+        echo
+        warning "Removing this worktree permanently discards those changes."
+    fi
+
+    if ! confirm "Remove the worktree and free '$branch'?"; then
+        info "Keeping '$branch'."
+        return 1
+    fi
+
+    if [[ "$state" == "DIRTY" ]]; then
+        local typed
+        typed="$(gum input --placeholder "Type DELETE to discard the changes")"
+
+        if [[ "$typed" != "DELETE" ]]; then
+            info "Confirmation did not match; keeping '$branch'."
+            return 1
+        fi
+    fi
+
+    if [[ "$state" == "LOCKED" ]]; then
+        git worktree unlock "$path" >/dev/null 2>&1 || true
+    fi
+
+    if ! output="$(git worktree remove --force "$path" 2>&1)"; then
+        warning "Could not remove the worktree at $path:"
+        printf '%s\n' "$output" | sed 's/^/    /'
+        return 1
+    fi
+
+    git worktree prune
+    success "Removed worktree: $path"
+}
+
+#
+# Answers what 'git branch -d' would answer, without running it: Git accepts a
+# branch that is reachable from HEAD or from its own upstream. Asking first is
+# what keeps the assistant from tearing down a worktree for a deletion that then
+# fails anyway.
+#
+branch_is_safely_deletable() {
+    local branch="$1"
+    local upstream
+
+    git merge-base --is-ancestor "$branch" HEAD 2>/dev/null && return 0
+
+    upstream="$(
+        git for-each-ref --format='%(upstream:short)' "refs/heads/$branch"
+    )"
+
+    [[ -n "$upstream" ]] || return 1
+
+    git merge-base --is-ancestor "$branch" "$upstream" 2>/dev/null
+}
+
+#
+# The deletion rule both passes share. Ancestry against BASE_REF licenses a
+# forced deletion; everything else has to survive Git's own check.
+#
+# Exit codes: 0 deleted, 2 refused as unmerged, 1 refused for any other reason.
+#
+delete_branch_under_policy() {
+    local id="$1"
+
+    local branch
+    local git_merged
+    local output
+
+    branch="$(branch_field "$id" 2)"
+    git_merged="$(branch_field "$id" 8)"
+
+    if [[ "$git_merged" == "true" ]]; then
+        if output="$(git branch -D "$branch" 2>&1)"; then
+            success "Deleted (merged into $BASE_REF): $branch"
+            return 0
+        fi
+
+        report_git_refusal "$branch" "$output"
+        return 1
+    fi
+
+    if output="$(git branch -d "$branch" 2>&1)"; then
+        success "Deleted: $branch"
+        return 0
+    fi
+
+    report_git_refusal "$branch" "$output"
+
+    [[ "$output" == *"not fully merged"* ]] && return 2
+
+    return 1
+}
+
+#
+# Second pass for the branches a worktree pinned during the bulk run. Keeping it
+# out of the main loop means a large selection still runs unattended and only
+# stops for the few that need a decision.
+#
+clear_worktree_blocked_branches() {
+    local list="$1"
+    local unmerged="$2"
+    local force="${3:-false}"
+
+    local count
+    count=$(wc -l < "$list" | tr -d ' ')
+
+    [[ "$count" -eq 0 ]] && return
+
+    echo
+    warning "$count selected branch(es) are checked out in a worktree."
+    echo "Git cannot delete those while the worktree exists."
+    echo
+
+    if ! confirm "Go through them now?"; then
+        return
+    fi
 
     while IFS= read -r id; do
         [[ -z "$id" ]] && continue
 
         local branch
         local git_merged
-        local worktree
-        local output
 
         branch="$(branch_field "$id" 2)"
         git_merged="$(branch_field "$id" 8)"
-        worktree="$(branch_worktree_path "$branch")"
-
-        if [[ -n "$worktree" ]]; then
-            warning "Skipped '$branch': checked out in $worktree"
-            info "    Remove that worktree first, or switch it to another branch."
-            retained=$((retained + 1))
-            continue
-        fi
 
         #
-        # 'git branch -d' measures "merged" against HEAD, so running the
-        # assistant from a worktree that sits on a feature branch makes Git
-        # refuse branches that were merged long ago. The scan already answered
-        # the question against BASE_REF, which is what the user means, so trust
-        # that ancestry and delete without asking HEAD.
+        # Removing a worktree is destructive and cannot be undone for uncommitted
+        # changes, so it only happens when the branch deletion behind it will
+        # actually go through. Anything else trades real work for nothing.
         #
-        if [[ "$git_merged" == "true" ]]; then
-            if output="$(git branch -D "$branch" 2>&1)"; then
-                success "Deleted (merged into $BASE_REF): $branch"
-                deleted=$((deleted + 1))
-            else
-                report_git_refusal "$branch" "$output"
-                retained=$((retained + 1))
-            fi
-
+        if [[ "$force" != true &&
+            "$git_merged" != "true" ]] &&
+            ! branch_is_safely_deletable "$branch"
+        then
+            warning "Keeping '$branch': safe deletion would refuse it even without the worktree."
+            info "    Use 'Force delete selected branches' if you want it gone."
+            [[ -n "$unmerged" ]] && echo "$id" >> "$unmerged"
             continue
         fi
 
-        if output="$(git branch -d "$branch" 2>&1)"; then
-            success "Deleted: $branch"
-            deleted=$((deleted + 1))
+        remove_blocking_worktree "$branch" || continue
+
+        #
+        # The caller already established that a forced deletion is acceptable
+        # for this set, so trying the safe deletion first would only print a
+        # refusal that is immediately overruled.
+        #
+        if [[ "$force" == true ]]; then
+            force_delete_branch "$branch"
             continue
         fi
 
-        report_git_refusal "$branch" "$output"
-        retained=$((retained + 1))
+        local outcome=0
+        delete_branch_under_policy "$id" || outcome=$?
 
-        if [[ "$output" == *"not fully merged"* ]]; then
+        if [[ "$outcome" -eq 2 && -n "$unmerged" ]]; then
             echo "$id" >> "$unmerged"
         fi
+    done < "$list"
+}
+
+#
+# Forced deletion drops the branch label, never the commits, so the hash is
+# printed with the command that brings the branch back.
+#
+force_delete_branch() {
+    local branch="$1"
+    local hash
+    local output
+
+    hash="$(git rev-parse --short "$branch" 2>/dev/null || echo "?")"
+
+    if output="$(git branch -D "$branch" 2>&1)"; then
+        success "Deleted: $branch (restore with 'git branch $branch $hash')"
+        return 0
+    fi
+
+    report_git_refusal "$branch" "$output"
+    return 1
+}
+
+#
+# 'git branch -d' measures "merged" against HEAD, so running the assistant from a
+# worktree that sits on a feature branch would make Git refuse branches that were
+# merged long ago. delete_branch_under_policy asks BASE_REF instead, which is
+# what the user means by merged.
+#
+safe_delete_branches() {
+    local ids="$1"
+    local deleted=0
+    local retained=0
+    local unmerged="$TMP_ROOT/unmerged-branches.txt"
+    local blocked="$TMP_ROOT/worktree-blocked-branches.txt"
+
+    : > "$unmerged"
+    : > "$blocked"
+
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+
+        local branch
+        branch="$(branch_field "$id" 2)"
+
+        if [[ -n "$(branch_worktree_path "$branch")" ]]; then
+            echo "$id" >> "$blocked"
+            continue
+        fi
+
+        local outcome=0
+        delete_branch_under_policy "$id" || outcome=$?
+
+        case "$outcome" in
+            0)
+                deleted=$((deleted + 1))
+                ;;
+            2)
+                retained=$((retained + 1))
+                echo "$id" >> "$unmerged"
+                ;;
+            *)
+                retained=$((retained + 1))
+                ;;
+        esac
     done <<< "$ids"
 
     info "Deleted $deleted branch(es); retained $retained."
 
+    clear_worktree_blocked_branches "$blocked" "$unmerged"
     explain_unmerged_remainder "$unmerged"
 }
 
@@ -1494,34 +1705,38 @@ explain_unmerged_remainder() {
 delete_merged_pr_branches() {
     local ids="$1"
     local eligible="$TMP_ROOT/eligible-merged-branches.txt"
+    local blocked="$TMP_ROOT/worktree-blocked-branches.txt"
     local skipped=0
 
     : > "$eligible"
+    : > "$blocked"
 
     while IFS= read -r id; do
         [[ -z "$id" ]] && continue
 
         local branch
         local pr
-        local worktree
 
         branch="$(branch_field "$id" 2)"
         pr="$(branch_field "$id" 9)"
-        worktree="$(branch_worktree_path "$branch")"
 
         #
         # Every exclusion is reported. A silent drop looks exactly like a
         # deletion that worked, and the branch is still there afterwards.
         #
-        if [[ -n "$worktree" ]]; then
-            warning "Skipped '$branch': checked out in $worktree"
+        if [[ "$pr" != "merged" ]]; then
+            warning "Skipped '$branch': no merged pull request (PR state: ${pr:-unknown})"
             skipped=$((skipped + 1))
             continue
         fi
 
-        if [[ "$pr" != "merged" ]]; then
-            warning "Skipped '$branch': no merged pull request (PR state: ${pr:-unknown})"
-            skipped=$((skipped + 1))
+        #
+        # A merged pull request is exactly the case where clearing the worktree
+        # is justified, so these are held back for the second pass instead of
+        # being dropped.
+        #
+        if [[ -n "$(branch_worktree_path "$branch")" ]]; then
+            echo "$id" >> "$blocked"
             continue
         fi
 
@@ -1532,6 +1747,11 @@ delete_merged_pr_branches() {
     count=$(wc -l < "$eligible" | tr -d ' ')
 
     if [[ "$count" -eq 0 ]]; then
+        if [[ -s "$blocked" ]]; then
+            clear_worktree_blocked_branches "$blocked" "" true
+            return
+        fi
+
         echo
         warning "None of the selected branches have a confirmed merged PR."
         echo
@@ -1572,6 +1792,8 @@ delete_merged_pr_branches() {
             report_git_refusal "$branch" "$output"
         fi
     done < "$eligible"
+
+    clear_worktree_blocked_branches "$blocked" "" true
 }
 
 #
@@ -1590,8 +1812,10 @@ force_delete_branches() {
     : > "$report"
 
     {
-        printf '%-8s  %-4s  %8s  %s\n' "PR" "GONE" "UNMERGED" "BRANCH"
-        printf '%-8s  %-4s  %8s  %s\n' "--------" "----" "--------" "------"
+        printf '%-8s  %-4s  %-6s  %8s  %s\n' \
+            "PR" "GONE" "IN-WT" "UNMERGED" "BRANCH"
+        printf '%-8s  %-4s  %-6s  %8s  %s\n' \
+            "--------" "----" "------" "--------" "------"
     } >> "$report"
 
     while IFS= read -r id; do
@@ -1600,26 +1824,20 @@ force_delete_branches() {
         local branch
         local gone
         local pr
-        local worktree
 
         branch="$(branch_field "$id" 2)"
         gone="$(branch_field "$id" 6)"
         pr="$(branch_field "$id" 9)"
-        worktree="$(branch_worktree_path "$branch")"
 
-        if [[ -n "$worktree" ]]; then
-            warning "Skipped '$branch': checked out in $worktree"
-            continue
-        fi
-
-        printf '%-8s  %-4s  %8s  %s\n' \
+        printf '%-8s  %-4s  %-6s  %8s  %s\n' \
             "${pr:-unknown}" \
             "$([[ "$gone" == "true" ]] && echo yes || echo no)" \
+            "$([[ -n "$(branch_worktree_path "$branch")" ]] && echo yes || echo no)" \
             "$(commits_not_on_base "$branch")" \
             "$branch" \
             >> "$report"
 
-        echo "$branch" >> "$eligible"
+        echo "$id" >> "$eligible"
     done <<< "$ids"
 
     local count
@@ -1639,8 +1857,12 @@ force_delete_branches() {
     echo "branch shows a count here too, so a non-zero number is not by itself"
     echo "proof of lost work; a merged PR is."
     echo
-    echo "The commit hashes are printed below and stay in the reflog, so a"
-    echo "deleted branch can be restored with 'git branch <name> <hash>'."
+    echo "IN-WT means a worktree still has the branch checked out. Git cannot"
+    echo "delete those at all, so the worktree is removed first and each one is"
+    echo "confirmed separately."
+    echo
+    echo "The commit hash of every deleted branch is printed, and it stays in"
+    echo "the reflog, so a branch can be restored with 'git branch <name> <hash>'."
     echo
 
     if ! confirm "Force delete these $count branches?"; then
@@ -1656,19 +1878,14 @@ force_delete_branches() {
         return
     fi
 
-    while IFS= read -r branch; do
-        [[ -z "$branch" ]] && continue
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
 
-        local hash
-        local output
+        local branch
+        branch="$(branch_field "$id" 2)"
 
-        hash="$(git rev-parse --short "$branch" 2>/dev/null || echo "?")"
-
-        if output="$(git branch -D "$branch" 2>&1)"; then
-            success "Deleted: $branch (restore with 'git branch $branch $hash')"
-        else
-            report_git_refusal "$branch" "$output"
-        fi
+        remove_blocking_worktree "$branch" || continue
+        force_delete_branch "$branch"
     done < "$eligible"
 
     echo
@@ -1700,9 +1917,12 @@ review_branch_individually() {
 
     if [[ -n "$worktree" ]]; then
         warning "This branch is checked out in $worktree."
-        info "Remove that worktree first, or switch it to another branch."
-        gum input --placeholder "Press Enter to continue" >/dev/null
-        return
+        echo
+
+        if ! remove_blocking_worktree "$branch"; then
+            gum input --placeholder "Press Enter to continue" >/dev/null
+            return
+        fi
     fi
 
     local action
@@ -1745,12 +1965,7 @@ review_branch_individually() {
                 )"
 
                 if [[ "$typed" == "DELETE" ]]; then
-                    local hash
-                    hash="$(git rev-parse --short "$branch" 2>/dev/null || echo "?")"
-
-                    if git branch -D "$branch"; then
-                        info "Restore with 'git branch $branch $hash' if needed."
-                    fi
+                    force_delete_branch "$branch"
                 fi
             fi
             ;;

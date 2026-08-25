@@ -16,6 +16,8 @@ losing work you still need.
 - Guided cleanup that goes straight for the obvious candidates
 - Caches pull request metadata once per run instead of querying per branch
 - Bulk force deletion for branches Git will never call merged, gated behind an evidence table
+- Clears the worktree that pins a branch as part of deleting it, instead of sending you to
+  another menu
 - Checks once a day whether a newer release exists and can upgrade itself via Homebrew
 
 ## Safety rules
@@ -24,7 +26,10 @@ The whole point is that a bulk delete stays boring. These rules are enforced in 
 
 - The primary worktree and its branch are never removed
 - Dirty worktrees are never bulk deleted; removing one needs a typed `DELETE` confirmation
-- Checked-out branches are never deleted
+- A branch checked out in a worktree is never deleted behind your back; the assistant
+  offers to remove the worktree first and confirms that removal separately
+- A worktree is only removed when the branch deletion behind it will actually go through,
+  so uncommitted work is never discarded for a deletion that then fails
 - A `gone` upstream alone never triggers a forced branch deletion
 - Forced deletion is offered automatically only when GitHub confirms the pull request was merged
 - Every refusal and every skipped branch is reported with Git's own reason, so a run that
