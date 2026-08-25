@@ -171,6 +171,10 @@ input_value() {
         --value "$value"
 }
 
+plural_verb() {
+    [[ "$1" -eq 1 ]] && echo "needs" || echo "need"
+}
+
 age_in_days() {
     local epoch="$1"
     local now
@@ -183,17 +187,6 @@ age_in_days() {
     fi
 
     echo $(( (now - epoch) / 86400 ))
-}
-
-truncate() {
-    local text="$1"
-    local max="$2"
-
-    if [[ ${#text} -le $max ]]; then
-        printf '%s' "$text"
-    else
-        printf '%s…' "${text:0:$((max - 1))}"
-    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -1259,7 +1252,7 @@ worktree_menu() {
 branch_display_rows() {
     local mode="$1"
 
-    awk -F '\t' -v mode="$mode" -v stale="$STALE_DAYS" '
+    awk -F '\t' -v mode="$mode" '
         {
             id=$1
             branch=$2
@@ -1269,33 +1262,11 @@ branch_display_rows() {
             gitmerged=$8
             pr=$9
 
-            candidate = (pr == "merged" ||
-                gone == "true" ||
-                gitmerged == "true" ||
-                (age != "?" && age >= stale))
-
-            strong = (pr == "merged" &&
-                checked != "true")
-
-            include = 0
-
-            if (mode == "all") {
-                include = 1
-            }
-            else if (mode == "candidates" && candidate) {
-                include = 1
-            }
-            else if (mode == "merged" && strong) {
-                include = 1
-            }
-            else if (mode == "gone" && gone == "true") {
-                include = 1
-            }
-            else if (mode == "old" && age != "?" && age >= stale) {
-                include = 1
-            }
-
-            if (!include) {
+            #
+            # A branch a worktree has checked out is a candidate like any other
+            # now that deleting it clears the worktree first.
+            #
+            if (mode != "all" && !(mode == "merged" && pr == "merged")) {
                 next
             }
 
@@ -1327,7 +1298,7 @@ select_branches() {
         gum filter \
             --no-limit \
             --height "$LIST_HEIGHT" \
-            --header "Tab / Ctrl+Space selects. Enter confirms. Type to filter." \
+            --header "Type MERGED, GONE, GIT or IN-WT to narrow. Tab selects, Enter confirms." \
             --placeholder "Filter branches..."
 }
 
@@ -1542,70 +1513,6 @@ delete_branch_under_policy() {
 # out of the main loop means a large selection still runs unattended and only
 # stops for the few that need a decision.
 #
-clear_worktree_blocked_branches() {
-    local list="$1"
-    local unmerged="$2"
-    local force="${3:-false}"
-
-    local count
-    count=$(wc -l < "$list" | tr -d ' ')
-
-    [[ "$count" -eq 0 ]] && return
-
-    echo
-    warning "$count selected branch(es) are checked out in a worktree."
-    echo "Git cannot delete those while the worktree exists."
-    echo
-
-    if ! confirm "Go through them now?"; then
-        return
-    fi
-
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
-
-        local branch
-        local git_merged
-
-        branch="$(branch_field "$id" 2)"
-        git_merged="$(branch_field "$id" 8)"
-
-        #
-        # Removing a worktree is destructive and cannot be undone for uncommitted
-        # changes, so it only happens when the branch deletion behind it will
-        # actually go through. Anything else trades real work for nothing.
-        #
-        if [[ "$force" != true &&
-            "$git_merged" != "true" ]] &&
-            ! branch_is_safely_deletable "$branch"
-        then
-            warning "Keeping '$branch': safe deletion would refuse it even without the worktree."
-            info "    Use 'Force delete selected branches' if you want it gone."
-            [[ -n "$unmerged" ]] && echo "$id" >> "$unmerged"
-            continue
-        fi
-
-        remove_blocking_worktree "$branch" || continue
-
-        #
-        # The caller already established that a forced deletion is acceptable
-        # for this set, so trying the safe deletion first would only print a
-        # refusal that is immediately overruled.
-        #
-        if [[ "$force" == true ]]; then
-            force_delete_branch "$branch"
-            continue
-        fi
-
-        local outcome=0
-        delete_branch_under_policy "$id" || outcome=$?
-
-        if [[ "$outcome" -eq 2 && -n "$unmerged" ]]; then
-            echo "$id" >> "$unmerged"
-        fi
-    done < "$list"
-}
-
 #
 # Forced deletion drops the branch label, never the commits, so the hash is
 # printed with the command that brings the branch back.
@@ -1627,196 +1534,58 @@ force_delete_branch() {
 }
 
 #
-# 'git branch -d' measures "merged" against HEAD, so running the assistant from a
-# worktree that sits on a feature branch would make Git refuse branches that were
-# merged long ago. delete_branch_under_policy asks BASE_REF instead, which is
-# what the user means by merged.
+# What the assistant knows about a branch, in the terms the user cares about.
 #
-safe_delete_branches() {
-    local ids="$1"
-    local deleted=0
-    local retained=0
-    local unmerged="$TMP_ROOT/unmerged-branches.txt"
-    local blocked="$TMP_ROOT/worktree-blocked-branches.txt"
-
-    : > "$unmerged"
-    : > "$blocked"
-
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
-
-        local branch
-        branch="$(branch_field "$id" 2)"
-
-        if [[ -n "$(branch_worktree_path "$branch")" ]]; then
-            echo "$id" >> "$blocked"
-            continue
-        fi
-
-        local outcome=0
-        delete_branch_under_policy "$id" || outcome=$?
-
-        case "$outcome" in
-            0)
-                deleted=$((deleted + 1))
-                ;;
-            2)
-                retained=$((retained + 1))
-                echo "$id" >> "$unmerged"
-                ;;
-            *)
-                retained=$((retained + 1))
-                ;;
-        esac
-    done <<< "$ids"
-
-    info "Deleted $deleted branch(es); retained $retained."
-
-    clear_worktree_blocked_branches "$blocked" "$unmerged"
-    explain_unmerged_remainder "$unmerged"
-}
-
+#   PRIMARY  the primary worktree has it checked out; it always stays
+#   PROVEN   ancestry against BASE_REF or a merged pull request settles it
+#   SAFE     Git itself would accept the deletion
+#   FORCE    nothing proves it is merged; only a forced deletion removes it
 #
-# In a squash-merge repository every merged branch keeps commits that never
-# appear on the base ref, so Git calls all of them unmerged and safe deletion
-# clears nothing at all. Say so, instead of letting the run end on a wall of
-# refusals that reads like a broken tool.
+# The suffix ":WT" means a worktree still has the branch checked out, so the
+# worktree has to go first whatever the class says.
 #
-explain_unmerged_remainder() {
-    local list="$1"
-    local count
+classify_branch() {
+    local id="$1"
 
-    count=$(wc -l < "$list" | tr -d ' ')
+    local branch
+    local git_merged
+    local pr
+    local path
+    local class
 
-    [[ "$count" -eq 0 ]] && return
+    branch="$(branch_field "$id" 2)"
+    git_merged="$(branch_field "$id" 8)"
+    pr="$(branch_field "$id" 9)"
+    path="$(branch_worktree_path "$branch")"
 
-    echo
-    warning "$count branch(es) still hold commits that are not on $BASE_REF."
-    echo
-    echo "That is the normal state after a squash merge: the merge rewrote the"
-    echo "commits, so Git never sees the original tips as merged. Safe deletion"
-    echo "cannot clear these; use 'Force delete selected branches' and check the"
-    echo "evidence per branch there."
-    echo
-
-    gum input --placeholder "Press Enter to continue" >/dev/null
-}
-
-delete_merged_pr_branches() {
-    local ids="$1"
-    local eligible="$TMP_ROOT/eligible-merged-branches.txt"
-    local blocked="$TMP_ROOT/worktree-blocked-branches.txt"
-    local skipped=0
-
-    : > "$eligible"
-    : > "$blocked"
-
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
-
-        local branch
-        local pr
-
-        branch="$(branch_field "$id" 2)"
-        pr="$(branch_field "$id" 9)"
-
-        #
-        # Every exclusion is reported. A silent drop looks exactly like a
-        # deletion that worked, and the branch is still there afterwards.
-        #
-        if [[ "$pr" != "merged" ]]; then
-            warning "Skipped '$branch': no merged pull request (PR state: ${pr:-unknown})"
-            skipped=$((skipped + 1))
-            continue
-        fi
-
-        #
-        # A merged pull request is exactly the case where clearing the worktree
-        # is justified, so these are held back for the second pass instead of
-        # being dropped.
-        #
-        if [[ -n "$(branch_worktree_path "$branch")" ]]; then
-            echo "$id" >> "$blocked"
-            continue
-        fi
-
-        echo "$branch" >> "$eligible"
-    done <<< "$ids"
-
-    local count
-    count=$(wc -l < "$eligible" | tr -d ' ')
-
-    if [[ "$count" -eq 0 ]]; then
-        if [[ -s "$blocked" ]]; then
-            clear_worktree_blocked_branches "$blocked" "" true
-            return
-        fi
-
-        echo
-        warning "None of the selected branches have a confirmed merged PR."
-        echo
-        echo "Abandoned branches never reach this path by design. Delete them"
-        echo "through 'Force delete selected branches' instead."
-        echo
-        gum input --placeholder "Press Enter to continue" >/dev/null
+    if [[ -n "$path" && "$path" == "$PRIMARY_WORKTREE" ]]; then
+        echo "PRIMARY"
         return
     fi
 
-    gum pager < "$eligible"
-
-    warning "These $count local branches have GitHub-confirmed merged PRs."
-
-    if [[ "$skipped" -gt 0 ]]; then
-        info "$skipped further selected branch(es) were skipped; see above."
+    if [[ "$git_merged" == "true" || "$pr" == "merged" ]]; then
+        class="PROVEN"
+    elif branch_is_safely_deletable "$branch"; then
+        class="SAFE"
+    else
+        class="FORCE"
     fi
 
-    echo
-    echo "For squash merges Git may not consider their original commits merged,"
-    echo "so this operation may use 'git branch -D'."
-    echo
+    [[ -n "$path" ]] && class="$class:WT"
 
-    if ! confirm "Delete these $count local branches?"; then
-        return
-    fi
-
-    while IFS= read -r branch; do
-        [[ -z "$branch" ]] && continue
-
-        local output
-
-        if output="$(git branch -d "$branch" 2>&1)"; then
-            success "Deleted: $branch"
-        elif output="$(git branch -D "$branch" 2>&1)"; then
-            success "Deleted squash-merged branch: $branch"
-        else
-            report_git_refusal "$branch" "$output"
-        fi
-    done < "$eligible"
-
-    clear_worktree_blocked_branches "$blocked" "" true
+    echo "$class"
 }
 
-#
-# The bulk counterpart to the per-branch force deletion. Squash-merged and
-# abandoned branches are both unmergeable from Git's point of view, so without
-# this path a selection of them can only be cleared one confirmation dialog at a
-# time. The evidence table and the recorded commit hashes carry the safety: a
-# forced deletion drops the branch label, never the commits.
-#
-force_delete_branches() {
+write_evidence_table() {
     local ids="$1"
-    local eligible="$TMP_ROOT/force-delete-branches.txt"
-    local report="$TMP_ROOT/force-delete-report.txt"
-
-    : > "$eligible"
-    : > "$report"
+    local report="$2"
 
     {
         printf '%-8s  %-4s  %-6s  %8s  %s\n' \
             "PR" "GONE" "IN-WT" "UNMERGED" "BRANCH"
         printf '%-8s  %-4s  %-6s  %8s  %s\n' \
             "--------" "----" "------" "--------" "------"
-    } >> "$report"
+    } > "$report"
 
     while IFS= read -r id; do
         [[ -z "$id" ]] && continue
@@ -1836,36 +1605,164 @@ force_delete_branches() {
             "$(commits_not_on_base "$branch")" \
             "$branch" \
             >> "$report"
+    done <<< "$ids"
+}
 
-        echo "$id" >> "$eligible"
+#
+# One action for the whole selection.
+#
+# Asking the user to pick a deletion strategy up front was the reason a run could
+# end with nothing deleted: a mixed selection has no single right strategy, and
+# whichever one was chosen silently dropped the branches it did not cover. The
+# assistant already knows per branch what applies, so it decides, shows the plan,
+# and asks only where the answer costs something.
+#
+delete_selected_branches() {
+    local ids="$1"
+
+    local proven="$TMP_ROOT/plan-proven.txt"
+    local forced="$TMP_ROOT/plan-forced.txt"
+    local kept="$TMP_ROOT/plan-kept.txt"
+    local report="$TMP_ROOT/plan-evidence.txt"
+
+    : > "$proven"
+    : > "$forced"
+    : > "$kept"
+
+    local blocked_proven=0
+    local blocked_forced=0
+
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+
+        case "$(classify_branch "$id")" in
+            PRIMARY)
+                echo "$id" >> "$kept"
+                ;;
+            PROVEN|SAFE)
+                echo "$id" >> "$proven"
+                ;;
+            PROVEN:WT|SAFE:WT)
+                echo "$id" >> "$proven"
+                blocked_proven=$((blocked_proven + 1))
+                ;;
+            FORCE)
+                echo "$id" >> "$forced"
+                ;;
+            FORCE:WT)
+                echo "$id" >> "$forced"
+                blocked_forced=$((blocked_forced + 1))
+                ;;
+        esac
     done <<< "$ids"
 
-    local count
-    count=$(wc -l < "$eligible" | tr -d ' ')
+    local proven_count
+    local forced_count
+    local kept_count
 
-    if [[ "$count" -eq 0 ]]; then
-        warning "Nothing left to force delete."
+    proven_count=$(wc -l < "$proven" | tr -d ' ')
+    forced_count=$(wc -l < "$forced" | tr -d ' ')
+    kept_count=$(wc -l < "$kept" | tr -d ' ')
+
+    clear
+    title "Deletion Plan"
+
+    if [[ "$proven_count" -gt 0 ]]; then
+        echo "  ${GREEN}$proven_count${RESET} delete"
+        echo "      merged into $BASE_REF, confirmed by a merged pull request,"
+        echo "      or accepted by Git itself"
+
+        if [[ "$blocked_proven" -gt 0 ]]; then
+            echo "      $blocked_proven of them $(plural_verb "$blocked_proven") a worktree removed first"
+        fi
+
+        echo
+    fi
+
+    if [[ "$forced_count" -gt 0 ]]; then
+        echo "  ${YELLOW}$forced_count${RESET} force delete"
+        echo "      nothing proves these are merged; confirmed separately"
+
+        if [[ "$blocked_forced" -gt 0 ]]; then
+            echo "      $blocked_forced of them $(plural_verb "$blocked_forced") a worktree removed first"
+        fi
+
+        echo
+    fi
+
+    if [[ "$kept_count" -gt 0 ]]; then
+        echo "  ${CYAN}$kept_count${RESET} keep"
+        echo "      checked out in the primary worktree, which always stays"
+        echo
+    fi
+
+    if [[ "$proven_count" -eq 0 && "$forced_count" -eq 0 ]]; then
+        warning "Nothing in this selection can be deleted."
         gum input --placeholder "Press Enter to continue" >/dev/null
         return
     fi
 
+    if ! confirm "Run this plan?"; then
+        return
+    fi
+
+    echo
+
+    if [[ "$proven_count" -gt 0 ]]; then
+        run_proven_deletions "$proven"
+    fi
+
+    if [[ "$forced_count" -gt 0 ]]; then
+        run_forced_deletions "$forced" "$report"
+    fi
+
+    echo
+    gum input --placeholder "Press Enter to continue" >/dev/null
+}
+
+run_proven_deletions() {
+    local list="$1"
+
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+
+        local branch
+        branch="$(branch_field "$id" 2)"
+
+        remove_blocking_worktree "$branch" || continue
+        delete_branch_under_policy "$id"
+    done < "$list"
+}
+
+#
+# The evidence table and the typed confirmation cover the whole forced group at
+# once. A squash merge leaves every branch looking unmerged, so this is the
+# normal path in a squash-merge repository, not an exception.
+#
+run_forced_deletions() {
+    local list="$1"
+    local report="$2"
+
+    local count
+    count=$(wc -l < "$list" | tr -d ' ')
+
+    write_evidence_table "$(cat "$list")" "$report"
+
+    echo
     gum pager < "$report"
 
     warning "Force deleting $count branch(es) skips every merge check."
     echo
-    echo "UNMERGED counts commits that are not on $BASE_REF. A squash-merged"
-    echo "branch shows a count here too, so a non-zero number is not by itself"
-    echo "proof of lost work; a merged PR is."
-    echo
-    echo "IN-WT means a worktree still has the branch checked out. Git cannot"
-    echo "delete those at all, so the worktree is removed first and each one is"
-    echo "confirmed separately."
+    echo "UNMERGED counts commits that are not on $BASE_REF. A squash merge"
+    echo "rewrites the commits, so a squash-merged branch shows a count here"
+    echo "too; a non-zero number is not by itself proof of lost work."
     echo
     echo "The commit hash of every deleted branch is printed, and it stays in"
     echo "the reflog, so a branch can be restored with 'git branch <name> <hash>'."
     echo
 
     if ! confirm "Force delete these $count branches?"; then
+        info "Kept all $count."
         return
     fi
 
@@ -1873,8 +1770,7 @@ force_delete_branches() {
     typed="$(gum input --placeholder "Type DELETE to confirm")"
 
     if [[ "$typed" != "DELETE" ]]; then
-        warning "Confirmation did not match; nothing was deleted."
-        gum input --placeholder "Press Enter to continue" >/dev/null
+        warning "Confirmation did not match; kept all $count."
         return
     fi
 
@@ -1886,10 +1782,7 @@ force_delete_branches() {
 
         remove_blocking_worktree "$branch" || continue
         force_delete_branch "$branch"
-    done < "$eligible"
-
-    echo
-    gum input --placeholder "Press Enter to continue" >/dev/null
+    done < "$list"
 }
 
 review_branch_individually() {
@@ -1972,6 +1865,15 @@ review_branch_individually() {
     esac
 }
 
+#
+# One list, one action.
+#
+# The old flow asked for a cleanup mode before showing anything, then asked which
+# deletion strategy to use. Both questions came too early: the buckets overlap, so
+# there is no right mode to pick, and a mixed selection has no single right
+# strategy. The list already carries the flags, gum filters on them as you type,
+# and the plan decides the strategy per branch.
+#
 branch_menu() {
     while true; do
         refresh_repository_state
@@ -1979,81 +1881,31 @@ branch_menu() {
         clear
         title "Local Branch Cleanup"
 
-        local action
-        action="$(
-            menu \
-                "Choose a branch cleanup mode" \
-                "Merged GitHub PRs" \
-                "Gone upstream branches" \
-                "Older than ${STALE_DAYS} days" \
-                "All cleanup candidates" \
-                "Browse all local branches" \
-                "Back"
-        )"
-
-        local mode=""
-
-        case "$action" in
-            "Merged GitHub PRs")
-                mode="merged"
-                ;;
-            "Gone upstream branches")
-                mode="gone"
-                ;;
-            "Older than ${STALE_DAYS} days")
-                mode="old"
-                ;;
-            "All cleanup candidates")
-                mode="candidates"
-                ;;
-            "Browse all local branches")
-                mode="all"
-                ;;
-            *)
-                return
-                ;;
-        esac
-
         local selected
         local ids
 
-        selected="$(select_branches "$mode")" || continue
-        [[ -z "$selected" ]] && continue
+        selected="$(select_branches all)" || return
+        [[ -z "$selected" ]] && return
 
         ids="$(printf '%s\n' "$selected" | selected_ids)"
 
         local next
         next="$(
             menu \
-                "Selected branches" \
+                "$(wc -l <<< "$ids" | tr -d ' ') branch(es) selected" \
+                "Delete selected" \
                 "Inspect selection" \
-                "Try safe delete selected" \
-                "Delete selected branches with MERGED PR" \
-                "Force delete selected branches" \
                 "Review selected individually" \
-                "Cancel"
+                "Back to the list"
         )"
 
         case "$next" in
+            "Delete selected")
+                delete_selected_branches "$ids"
+                ;;
+
             "Inspect selection")
                 show_branch_details "$ids"
-                ;;
-
-            "Try safe delete selected")
-                show_branch_details "$ids"
-
-                if confirm "Try safe deletion for the selected branches?"; then
-                    safe_delete_branches "$ids"
-                fi
-                ;;
-
-            "Delete selected branches with MERGED PR")
-                show_branch_details "$ids"
-                delete_merged_pr_branches "$ids"
-                ;;
-
-            "Force delete selected branches")
-                force_delete_branches "$ids"
                 ;;
 
             "Review selected individually")
@@ -2094,7 +1946,7 @@ guided_cleanup() {
 
         merged_branches="$(
             awk -F '\t' '
-                $7 == "false" && $9 == "merged" {
+                $9 == "merged" {
                     count++
                 }
 
@@ -2156,8 +2008,7 @@ guided_cleanup() {
 
                 ids="$(printf '%s\n' "$selected" | selected_ids)"
 
-                show_branch_details "$ids"
-                delete_merged_pr_branches "$ids"
+                delete_selected_branches "$ids"
                 ;;
 
             "Review everything manually")

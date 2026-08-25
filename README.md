@@ -13,12 +13,44 @@ losing work you still need.
 - Lists worktrees and local branches with age, state, upstream status and pull request status
 - Detects merged pull requests through the GitHub API, including squash merges
 - Multi-select with fuzzy search, so you can pick 20 branches in one pass
-- Guided cleanup that goes straight for the obvious candidates
-- Caches pull request metadata once per run instead of querying per branch
-- Bulk force deletion for branches Git will never call merged, gated behind an evidence table
+- One delete action that works out per branch what applies, instead of asking you to pick
+  a strategy for a mixed selection
 - Clears the worktree that pins a branch as part of deleting it, instead of sending you to
   another menu
+- Bulk force deletion for branches Git will never call merged, gated behind an evidence table
+- Guided cleanup that goes straight for the obvious candidates
+- Caches pull request metadata once per run instead of querying per branch
 - Checks once a day whether a newer release exists and can upgrade itself via Homebrew
+
+## How deleting works
+
+Pick branches from one list; typing filters it, so `GONE`, `MERGED`, `GIT` and `IN-WT`
+narrow it down without a separate menu. Then choose **Delete selected** once. The
+assistant sorts the selection itself and shows the plan before it touches anything:
+
+```
+Deletion Plan
+
+  6 delete
+      merged into origin/main, confirmed by a merged pull request,
+      or accepted by Git itself
+      2 of them need a worktree removed first
+
+  3 force delete
+      nothing proves these are merged; confirmed separately
+
+  1 keep
+      checked out in the primary worktree, which always stays
+```
+
+Deletions Git or GitHub can vouch for run straight through. The rest is held back behind
+an evidence table and a typed `DELETE`, and any worktree in the way is confirmed on its
+own before it is removed.
+
+This replaces the earlier flow, which asked for a cleanup mode before showing anything and
+then for a deletion strategy. Both questions came too early: the modes overlap, so there
+was no right one to pick, and a mixed selection has no single right strategy — whichever
+one you chose silently dropped the branches it did not cover.
 
 ## Safety rules
 
@@ -31,7 +63,8 @@ The whole point is that a bulk delete stays boring. These rules are enforced in 
 - A worktree is only removed when the branch deletion behind it will actually go through,
   so uncommitted work is never discarded for a deletion that then fails
 - A `gone` upstream alone never triggers a forced branch deletion
-- Forced deletion is offered automatically only when GitHub confirms the pull request was merged
+- A branch is deleted without a further question only when its merge is proven: reachable
+  from the base ref, confirmed by a merged pull request, or accepted by `git branch -d`
 - Every refusal and every skipped branch is reported with Git's own reason, so a run that
   deletes nothing says why
 - Forcing a deletion in bulk needs a typed `DELETE` confirmation and prints the commit hash
