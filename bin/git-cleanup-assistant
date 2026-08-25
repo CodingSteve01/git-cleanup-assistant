@@ -25,11 +25,12 @@
 set -u
 
 #
-# Kept in step with the release tag by the "Verify the version constant" step in
-# .github/workflows/bump-formula.yml, which fails the release when the two drift
-# apart. An update check that reports a stale version is worse than none.
+# The single source of truth for the released version. Raising it here and
+# merging to main is what publishes the tag, the GitHub release and the Homebrew
+# formula bump; see .github/workflows/release.yml. A merge that leaves it alone
+# releases nothing.
 #
-VERSION="0.1.1"
+VERSION="0.2.0"
 
 DEFAULT_STALE_DAYS=30
 DEFAULT_HEIGHT=24

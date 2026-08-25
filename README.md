@@ -97,6 +97,10 @@ the session untouched.
 Set `GIT_CLEANUP_ASSISTANT_NO_UPDATE_CHECK=1` to switch the check off. The timestamp of
 the last check lives in `${XDG_CACHE_HOME:-~/.cache}/git-cleanup-assistant/`.
 
+Releases are cut from the `VERSION` constant in the script: raising it and merging to
+`main` publishes the tag, the release and the Homebrew formula bump. See
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Install
 
 Via Homebrew:
