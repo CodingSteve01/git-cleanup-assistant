@@ -33,9 +33,13 @@ docs: ...      no release
 chore: ...     no release
 ```
 
-A scope is optional (`fix(worktree): ...`). A title that does not parse is rejected by the
-*Pull request title* check, because it would otherwise produce no release at all rather
-than an error.
+A scope is optional (`fix(worktree): ...`). Titles and commits are both checked by
+[commitlint](https://commitlint.js.org) against `commitlint.config.cjs` in the *Commit
+lint* workflow, because a title that does not parse would otherwise produce no release at
+all rather than an error.
+
+The body and footer line-length rules are off: squash merges discard the body, so the rule
+only ever rejected text that never reaches `main`.
 
 ## Releasing
 
