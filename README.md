@@ -16,6 +16,7 @@ losing work you still need.
 - Guided cleanup that goes straight for the obvious candidates
 - Caches pull request metadata once per run instead of querying per branch
 - Bulk force deletion for branches Git will never call merged, gated behind an evidence table
+- Checks once a day whether a newer release exists and can upgrade itself via Homebrew
 
 ## Safety rules
 
@@ -46,6 +47,17 @@ forever and safe deletion clears none of them. Two things follow:
 - Branches that a squash merge left behind are cleared through **Force delete selected
   branches**, which shows the pull request state, the `gone` flag and the number of commits
   that are not on the base ref for each branch before anything is deleted.
+
+## Updates
+
+Once a day, on startup, the assistant compares its own version against the latest
+GitHub release. When a newer one exists and the copy is managed by Homebrew, it offers
+the upgrade and restarts itself into the new version; otherwise it prints the release
+link and carries on. A missing network, a rate-limited API or no release at all leaves
+the session untouched.
+
+Set `GIT_CLEANUP_ASSISTANT_NO_UPDATE_CHECK=1` to switch the check off. The timestamp of
+the last check lives in `${XDG_CACHE_HOME:-~/.cache}/git-cleanup-assistant/`.
 
 ## Install
 

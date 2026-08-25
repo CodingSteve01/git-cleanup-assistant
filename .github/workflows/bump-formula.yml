@@ -20,6 +20,39 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      #
+      # The assistant reports its own version in the update check, so a release
+      # whose VERSION constant lags behind the tag would tell every user that
+      # they are already up to date. Fail before the formula is bumped.
+      #
+      - name: Check out the released source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          path: source
+
+      - name: Verify the version constant
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          declared="$(
+            sed -n 's/^VERSION="\(.*\)"$/\1/p' source/bin/git-cleanup-assistant
+          )"
+
+          test -n "$declared" || {
+            echo "No VERSION constant found in bin/git-cleanup-assistant." >&2
+            exit 1
+          }
+
+          if [ "$declared" != "${TAG#v}" ]; then
+            echo "VERSION is '$declared' but the tag is '$TAG'." >&2
+            exit 1
+          fi
+
+          echo "VERSION matches $TAG."
+
       - name: Resolve release and checksum
         id: release
         env:

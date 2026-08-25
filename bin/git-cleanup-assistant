@@ -24,9 +24,21 @@
 
 set -u
 
+#
+# Kept in step with the release tag by the "Verify the version constant" step in
+# .github/workflows/bump-formula.yml, which fails the release when the two drift
+# apart. An update check that reports a stale version is worse than none.
+#
+VERSION="0.1.1"
+
 DEFAULT_STALE_DAYS=30
 DEFAULT_HEIGHT=24
 DEFAULT_BASE_REF="origin/main"
+
+UPDATE_REPOSITORY="CodingSteve01/git-cleanup-assistant"
+UPDATE_FORMULA="CodingSteve01/tap/git-cleanup-assistant"
+UPDATE_CHECK_INTERVAL_SECONDS=86400
+UPDATE_STATE_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/git-cleanup-assistant/last-update-check"
 
 # -----------------------------------------------------------------------------
 # Temporary workspace
@@ -299,6 +311,113 @@ ensure_github_auth() {
     else
         warning "Continuing without GitHub PR information."
     fi
+}
+
+# -----------------------------------------------------------------------------
+# Update checking
+# -----------------------------------------------------------------------------
+
+#
+# Compares two dotted versions and succeeds when the first one is strictly newer.
+# The field sort keeps 0.10.0 above 0.2.0 without relying on GNU sort -V.
+#
+version_is_newer() {
+    local candidate="$1"
+    local current="$2"
+
+    [[ "$candidate" == "$current" ]] && return 1
+
+    local newest
+    newest="$(
+        printf '%s\n%s\n' "$candidate" "$current" |
+            sort -t. -k1,1n -k2,2n -k3,3n |
+            tail -1
+    )"
+
+    [[ "$newest" == "$candidate" ]]
+}
+
+update_check_is_due() {
+    [[ -f "$UPDATE_STATE_FILE" ]] || return 0
+
+    local last
+    last="$(cat "$UPDATE_STATE_FILE" 2>/dev/null || echo 0)"
+
+    [[ "$last" =~ ^[0-9]+$ ]] || return 0
+
+    (( $(date +%s) - last >= UPDATE_CHECK_INTERVAL_SECONDS ))
+}
+
+record_update_check() {
+    mkdir -p "$(dirname "$UPDATE_STATE_FILE")" 2>/dev/null || return 0
+    date +%s > "$UPDATE_STATE_FILE" 2>/dev/null || true
+}
+
+installed_via_homebrew() {
+    command_exists brew && brew list --formula git-cleanup-assistant >/dev/null 2>&1
+}
+
+#
+# Runs at most once a day and never blocks the session: a missing release, a
+# rate-limited API or no network all leave the assistant running as before.
+# Set GIT_CLEANUP_ASSISTANT_NO_UPDATE_CHECK=1 to skip it entirely.
+#
+check_for_update() {
+    [[ "${GIT_CLEANUP_ASSISTANT_NO_UPDATE_CHECK:-0}" == "1" ]] && return
+    [[ "$GH_AVAILABLE" == true ]] || return
+    update_check_is_due || return
+
+    local latest
+    latest="$(
+        gh api "repos/$UPDATE_REPOSITORY/releases/latest" \
+            --jq '.tag_name' \
+            2>/dev/null |
+            sed 's/^v//'
+    )"
+
+    record_update_check
+
+    [[ -n "$latest" ]] || return
+    version_is_newer "$latest" "$VERSION" || return
+
+    title "Update Available"
+
+    echo "Installed: $VERSION"
+    echo "Latest:    $latest"
+    echo
+    echo "https://github.com/$UPDATE_REPOSITORY/releases/tag/v$latest"
+    echo
+
+    if ! installed_via_homebrew; then
+        info "This copy is not managed by Homebrew; update it the way you installed it."
+        gum input --placeholder "Press Enter to continue" >/dev/null
+        return
+    fi
+
+    if ! confirm "Update to $latest now?"; then
+        return
+    fi
+
+    if ! brew upgrade "$UPDATE_FORMULA"; then
+        warning "The update failed; continuing with $VERSION."
+        gum input --placeholder "Press Enter to continue" >/dev/null
+        return
+    fi
+
+    #
+    # Bash reads a script incrementally, so continuing inside a file that
+    # Homebrew has just replaced is not safe. Hand over to the new copy instead.
+    #
+    local replacement
+    replacement="$(command -v git-cleanup-assistant || true)"
+
+    if [[ -n "$replacement" ]]; then
+        success "Updated to $latest; restarting."
+        exec "$replacement" "$@"
+    fi
+
+    success "Updated to $latest; start the assistant again to use it."
+    exit 0
 }
 
 # -----------------------------------------------------------------------------
@@ -1880,6 +1999,10 @@ show_final_report() {
 
 ensure_dependencies
 ensure_github_auth
+
+require_git_repository
+check_for_update "$@"
+
 initialize_repository
 
 MENU_HEIGHT="$DEFAULT_HEIGHT"
