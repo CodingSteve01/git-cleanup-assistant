@@ -19,16 +19,35 @@ Bug reports and small, focused pull requests are welcome.
   `awk` there rejects a line break directly after an opening parenthesis.
 - Match the existing style: four-space indent, section banners, functions that do one thing.
 
+## Commit and pull request titles
+
+Titles follow [Conventional Commits](https://www.conventionalcommits.org). The repository
+squash-merges, so the pull request title becomes the commit subject on `main`, and that
+subject is the only thing release-please reads:
+
+```
+fix: ...       patch release
+feat: ...      minor release
+feat!: ...     major release, as does a "BREAKING CHANGE:" body
+docs: ...      no release
+chore: ...     no release
+```
+
+A scope is optional (`fix(worktree): ...`). A title that does not parse is rejected by the
+*Pull request title* check, because it would otherwise produce no release at all rather
+than an error.
+
 ## Releasing
 
-`VERSION` in `bin/git-cleanup-assistant` is the single source of truth. Raise it in the
-pull request that carries the change; merging to `main` publishes the tag, the GitHub
-release with generated notes, and the Homebrew formula bump, in that order.
+Nobody picks version numbers. release-please keeps a release pull request open with the
+next version and the changelog derived from the commit subjects since the last tag.
+Merging that pull request publishes the tag and the GitHub release, and the same workflow
+then bumps the Homebrew formula.
 
-A merge that leaves `VERSION` alone releases nothing and ends quietly, so unreleased work
-can accumulate on `main` as usual. The assistant reports its own version in its update
-check, which is why the constant and the tag must agree: a stale constant would tell every
-user that they are already up to date.
+`VERSION` in `bin/git-cleanup-assistant`, `version.txt` and
+`.release-please-manifest.json` are all written by release-please. Do not edit them by
+hand; the `# x-release-please-version` annotation on the `VERSION` line is what lets it
+rewrite the constant, and the release job fails if the constant and the tag ever disagree.
 
 ## Scope
 

@@ -1,0 +1,51 @@
+name: Pull request title
+
+#
+# The repository squash-merges, so the pull request title becomes the commit
+# subject on main, and that subject is the only thing release-please reads. A
+# prose title therefore does not fail anything: it silently produces no release,
+# which is the exact failure this repository already had once. Check it here,
+# where it can still be edited.
+#
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Require a Conventional Commit subject
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+
+          pattern='^(feat|fix|perf|refactor|docs|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .+'
+
+          if printf '%s' "$TITLE" | grep -Eq "$pattern"; then
+            echo "Title is fine: $TITLE"
+            exit 0
+          fi
+
+          cat >&2 <<MESSAGE
+          The pull request title is not a Conventional Commit subject:
+
+            $TITLE
+
+          It becomes the commit subject on main, and release-please derives the
+          next version from it. Use one of:
+
+            fix: ...       patch release
+            feat: ...      minor release
+            feat!: ...     major release (or a "BREAKING CHANGE:" body)
+            docs: ...      no release
+            chore: ...     no release
+
+          A scope is optional, for example "fix(worktree): ...".
+          MESSAGE
+
+          exit 1
