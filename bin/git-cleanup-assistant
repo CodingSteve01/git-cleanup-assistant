@@ -848,7 +848,8 @@ parse_worktree_list() {
         }
 
         /^branch refs\/heads\// {
-            branch = substr($0, 20)
+            # "branch refs/heads/" is 18 characters, so the name starts at 19.
+            branch = substr($0, 19)
             next
         }
 
@@ -1189,23 +1190,71 @@ count_worktree_state() {
         "$WORKTREE_DATA"
 }
 
-count_worktree_merged() {
-    awk -F '\t' '$8 == "merged" { count++ } END { print count+0 }' \
-        "$WORKTREE_DATA"
+#
+# Counts by the evidence ladder, not by one rung of it.
+#
+# The dashboard used to report "Merged PR", which is the only rung a forge can
+# see. A repository full of squash merges therefore showed a small number right
+# above a plan that then classified three times as many as merged, and the two
+# screens contradicted each other on the one question the user is here to answer.
+# Both now count the same way.
+#
+count_worktree_class() {
+    local wanted="$1"
+
+    awk -F '\t' -v wanted="$wanted" '
+        FILENAME == branches {
+            if ($8 == "true" || $13 == "true") {
+                merged_branch[$2] = 1
+            }
+
+            next
+        }
+
+        {
+            if ($8 == "merged" || merged_branch[$3] == 1)
+                class = "MERGED"
+            else if ($7 == "true" && $8 != "open")
+                class = "ABANDONED"
+            else
+                class = "UNCLEAR"
+
+            if (class == wanted) {
+                count++
+            }
+        }
+
+        END {
+            print count+0
+        }
+    ' branches="$BRANCH_DATA" "$BRANCH_DATA" "$WORKTREE_DATA"
 }
 
-count_worktree_gone() {
-    awk -F '\t' '$7 == "true" { count++ } END { print count+0 }' \
-        "$WORKTREE_DATA"
+count_branch_class() {
+    local wanted="$1"
+
+    awk -F '\t' -v wanted="$wanted" '
+        {
+            if ($8 == "true" || $13 == "true" || $9 == "merged")
+                class = "MERGED"
+            else if ($6 == "true" && $9 != "open")
+                class = "ABANDONED"
+            else
+                class = "UNCLEAR"
+
+            if (class == wanted) {
+                count++
+            }
+        }
+
+        END {
+            print count+0
+        }
+    ' "$BRANCH_DATA"
 }
 
 count_branch_gone() {
     awk -F '\t' '$6 == "true" { count++ } END { print count+0 }' \
-        "$BRANCH_DATA"
-}
-
-count_branch_merged_pr() {
-    awk -F '\t' '$9 == "merged" { count++ } END { print count+0 }' \
         "$BRANCH_DATA"
 }
 
@@ -1229,30 +1278,37 @@ show_dashboard() {
     echo "Repository:      $REPO_ROOT"
     echo "Primary branch:  $PRIMARY_BRANCH"
     echo "Base ref:        $BASE_REF"
-    echo "Stale threshold: ${STALE_DAYS} days"
     echo
 
     if [[ "$GH_AVAILABLE" == true ]]; then
         echo "GitHub:          ${GREEN}enabled${RESET}"
     else
-        echo "GitHub:          ${YELLOW}unavailable${RESET}"
+        echo "GitHub:          ${YELLOW}unavailable${RESET} (git evidence only)"
     fi
 
     echo
-    echo "${BOLD}Worktrees${RESET}"
-    printf "  %-18s %s\n" "Total:" "$(count_rows "$WORKTREE_DATA")"
-    printf "  %-18s %s\n" "Clean:" "$(count_worktree_state CLEAN)"
-    printf "  %-18s %s\n" "Dirty:" "$(count_worktree_state DIRTY)"
-    printf "  %-18s %s\n" "Locked:" "$(count_worktree_state LOCKED)"
-    printf "  %-18s %s\n" "Merged PR:" "$(count_worktree_merged)"
-    printf "  %-18s %s\n" "Gone upstream:" "$(count_worktree_gone)"
+    printf "%-18s %8s  %8s\n" "" "WORKTREES" "BRANCHES"
+    printf "%-18s %8s  %8s\n" \
+        "Total" \
+        "$(count_rows "$WORKTREE_DATA")" \
+        "$(count_rows "$BRANCH_DATA")"
+    printf "%-18s %8s  %8s\n" \
+        "Merged" \
+        "$(count_worktree_class MERGED)" \
+        "$(count_branch_class MERGED)"
+    printf "%-18s %8s  %8s\n" \
+        "Abandoned" \
+        "$(count_worktree_class ABANDONED)" \
+        "$(count_branch_class ABANDONED)"
+    printf "%-18s %8s  %8s\n" \
+        "Unclear" \
+        "$(count_worktree_class UNCLEAR)" \
+        "$(count_branch_class UNCLEAR)"
 
     echo
-    echo "${BOLD}Local branches${RESET}"
-    printf "  %-18s %s\n" "Total:" "$(count_rows "$BRANCH_DATA")"
-    printf "  %-18s %s\n" "Merged PR:" "$(count_branch_merged_pr)"
-    printf "  %-18s %s\n" "Gone upstream:" "$(count_branch_gone)"
-    printf "  %-18s %s\n" "Older than ${STALE_DAYS}d:" "$(count_branch_old)"
+    printf "%-18s %8s\n" "Dirty worktrees" "$(count_worktree_state DIRTY)"
+    printf "%-18s %8s\n" "Locked worktrees" "$(count_worktree_state LOCKED)"
+    printf "%-18s %8s\n" "Older than ${STALE_DAYS}d" "$(count_branch_old)"
 
     echo
 }
@@ -1261,12 +1317,114 @@ show_dashboard() {
 # Worktree display
 # -----------------------------------------------------------------------------
 
-worktree_display_rows() {
-    local mode="$1"
+#
+# Looks a branch up in the branch scan by name rather than by id, which is how a
+# worktree reaches the merge evidence gathered for the branch it has checked out.
+#
+branch_data_field_by_name() {
+    local branch="$1"
+    local column="$2"
 
-    awk -F '\t' -v mode="$mode" -v stale="$STALE_DAYS" '
-        function yn(v, yes, no) {
-            return v == "true" ? yes : no
+    awk -F '\t' -v branch="$branch" -v column="$column" '
+        $2 == branch {
+            print $column
+            exit
+        }
+    ' "$BRANCH_DATA"
+}
+
+#
+# The same evidence ladder the branches use, applied to the worktree that holds
+# one.
+#
+# It used to be a different question here: worktrees were sorted into "safe",
+# "candidates" and "dirty" while branches were sorted into merged, abandoned and
+# unclear, so the same finished work was described two ways in two menus and
+# neither list said what the other would do about it. A worktree is a checkout of
+# a branch, and the reason to remove it is the reason that branch is finished.
+#
+#   PROVEN     the branch is on the base ref: by ancestry, by patch after a
+#              squash merge, or by a merged pull request
+#   ABANDONED  the remote branch was deleted and no pull request is open
+#   UNKNOWN    no signal either way
+#
+# The state is carried as a suffix, because it decides how the removal is
+# confirmed rather than whether the worktree is a candidate: ":DIRTY" and
+# ":LOCKED" are never removed in bulk, whatever the evidence says.
+#
+classify_worktree() {
+    local id="$1"
+
+    local branch
+    local state
+    local gone
+    local pr
+    local git_merged
+    local squash_merged
+    local class
+
+    branch="$(worktree_field "$id" 3)"
+    state="$(worktree_field "$id" 6)"
+    gone="$(worktree_field "$id" 7)"
+    pr="$(worktree_field "$id" 8)"
+
+    git_merged="$(branch_data_field_by_name "$branch" 8)"
+    squash_merged="$(branch_data_field_by_name "$branch" 13)"
+
+    if [[ "$pr" == "merged" ||
+        "$git_merged" == "true" ||
+        "$squash_merged" == "true" ]]
+    then
+        class="PROVEN"
+    elif [[ "$gone" == "true" && "$pr" != "open" ]]; then
+        class="ABANDONED"
+    else
+        class="UNKNOWN"
+    fi
+
+    [[ "$state" != "CLEAN" ]] && class="$class:$state"
+
+    echo "$class"
+}
+
+worktree_field() {
+    local id="$1"
+    local column="$2"
+
+    awk -F '\t' -v id="$id" -v column="$column" '
+        $1 == id {
+            print $column
+            exit
+        }
+    ' "$WORKTREE_DATA"
+}
+
+#
+# One list, in the same shape the branch list has: the class first, then what
+# decides how a removal is confirmed, then age, branch and path. Typing MERGED,
+# ABANDONED, UNCLEAR, DIRTY or LOCKED narrows it, which is what the four
+# overlapping modes were trying to be.
+#
+#
+# One list, in the same shape the branch list has: the class first, then what
+# decides how a removal is confirmed, then age, branch and path. Typing MERGED,
+# ABANDONED, UNCLEAR, DIRTY or LOCKED narrows it, which is what the four
+# overlapping modes were trying to be.
+#
+worktree_display_rows() {
+    #
+    # Reads the branch scan first, so the merge evidence gathered per branch —
+    # ancestry and patch equivalence, not just the pull request — decides the
+    # label here too. A worktree and the branch it holds can no longer be
+    # described differently in two lists.
+    #
+    awk -F '\t' '
+        FILENAME == branches {
+            if ($8 == "true" || $13 == "true") {
+                merged_branch[$2] = 1
+            }
+
+            next
         }
 
         {
@@ -1278,60 +1436,60 @@ worktree_display_rows() {
             gone=$7
             pr=$8
 
-            candidate = (pr == "merged" ||
-                gone == "true" ||
-                (age != "?" && age >= stale))
+            if (pr == "merged" || merged_branch[branch] == 1)
+                class = "MERGED"
+            else if (gone == "true" && pr != "open")
+                class = "ABANDONED"
+            else
+                class = "UNCLEAR"
 
-            safe = (state == "CLEAN")
-
-            include = 0
-
-            if (mode == "all") {
-                include = 1
-            }
-            else if (mode == "candidates" && candidate) {
-                include = 1
-            }
-            else if (mode == "safe" && candidate && safe) {
-                include = 1
-            }
-            else if (mode == "dirty" && state != "CLEAN") {
-                include = 1
-            }
-
-            if (!include) {
-                next
-            }
-
-            printf "%s | %-6s | %-6s | %-4s | %4sd | %s | %s\n",
+            printf "%s | %-9s | %-6s | %4sd | %s | %s\n",
                 id,
-                state,
-                (pr == "merged" ? "MERGED" : "-"),
-                (gone == "true" ? "GONE" : "-"),
+                class,
+                (state == "CLEAN" ? "-" : state),
                 age,
                 branch,
                 path
         }
-    ' "$WORKTREE_DATA"
+    ' branches="$BRANCH_DATA" "$BRANCH_DATA" "$WORKTREE_DATA"
 }
 
+#
+# Candidates start selected.
+#
+# Picking twenty worktrees out of a filter one Tab at a time is the step that
+# stops a cleanup from happening at all, and the tool already knows which ones it
+# would suggest. Deselecting the two you want to keep is the shorter path to the
+# same answer, and nothing is removed before the plan has been shown anyway.
+#
 select_worktrees() {
-    local mode="$1"
     local rows
+    local preselected
 
-    rows="$(worktree_display_rows "$mode")"
+    rows="$(worktree_display_rows)"
 
     if [[ -z "$rows" ]]; then
-        warning "No matching worktrees."
+        warning "No worktrees besides the primary one."
         gum input --placeholder "Press Enter to continue" >/dev/null
         return 1
     fi
+
+    preselected="$(
+        printf '%s\n' "$rows" |
+            awk -F ' \\| ' '
+                $2 ~ /MERGED|ABANDONED/ && $3 ~ /^ *- *$/ {
+                    print $0
+                }
+            ' |
+            paste -sd, -
+    )"
 
     printf '%s\n' "$rows" |
         gum filter \
             --no-limit \
             --height "$LIST_HEIGHT" \
-            --header "Tab / Ctrl+Space selects. Enter confirms. Type to filter." \
+            --selected "$preselected" \
+            --header "Merged and abandoned clean worktrees start selected. Tab toggles, Enter confirms. Type MERGED, ABANDONED, UNCLEAR, DIRTY or LOCKED to narrow." \
             --placeholder "Filter worktrees..."
 }
 
@@ -1428,32 +1586,160 @@ show_worktree_details() {
     gum pager < "$detail_file"
 }
 
-remove_selected_clean_worktrees() {
+#
+# One action for a whole worktree selection, with the same shape as the branch
+# plan: sort by evidence, show what will happen, ask once for everything the
+# ladder cleared, and hold back what needs a decision.
+#
+# The old flow asked which of four overlapping modes to enter, then which of
+# three actions to run inside it, and quietly dropped whatever the chosen action
+# did not cover. Nothing in that sequence was a question the user had the
+# information to answer.
+#
+plan_worktree_removals() {
     local ids="$1"
+
+    local proven="$TMP_ROOT/wt-plan-proven.txt"
+    local abandoned="$TMP_ROOT/wt-plan-abandoned.txt"
+    local unknown="$TMP_ROOT/wt-plan-unknown.txt"
+    local held="$TMP_ROOT/wt-plan-held.txt"
+
+    : > "$proven"
+    : > "$abandoned"
+    : > "$unknown"
+    : > "$held"
+
+    local id
+    local class
+
+    load_ids "$ids"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+        class="$(classify_worktree "$id")"
+
+        #
+        # A dirty or locked worktree is never removed in bulk, whatever the
+        # evidence says: the evidence is about the branch, and what is at stake
+        # here is uncommitted work.
+        #
+        case "$class" in
+            *:DIRTY|*:LOCKED) echo "$id" >> "$held" ;;
+            PROVEN)           echo "$id" >> "$proven" ;;
+            ABANDONED)        echo "$id" >> "$abandoned" ;;
+            *)                echo "$id" >> "$unknown" ;;
+        esac
+    done
+
+    local proven_count
+    local abandoned_count
+    local unknown_count
+    local held_count
+
+    proven_count=$(count_rows "$proven")
+    abandoned_count=$(count_rows "$abandoned")
+    unknown_count=$(count_rows "$unknown")
+    held_count=$(count_rows "$held")
+
+    local clearing=$((proven_count + abandoned_count))
+
+    clear
+    title "Worktree Removal Plan"
+
+    if [[ "$proven_count" -gt 0 ]]; then
+        echo "  ${GREEN}$proven_count${RESET} merged"
+        echo "      the branch is already on $BASE_REF"
+        echo
+    fi
+
+    if [[ "$abandoned_count" -gt 0 ]]; then
+        echo "  ${GREEN}$abandoned_count${RESET} abandoned"
+        echo "      the remote branch was deleted and no pull request is open"
+        echo
+    fi
+
+    if [[ "$unknown_count" -gt 0 ]]; then
+        echo "  ${YELLOW}$unknown_count${RESET} unclear"
+        echo "      no signal either way; confirmed separately"
+        echo
+    fi
+
+    if [[ "$held_count" -gt 0 ]]; then
+        echo "  ${CYAN}$held_count${RESET} dirty or locked"
+        echo "      never removed in bulk; reviewed one at a time"
+        echo
+    fi
+
+    if [[ "$clearing" -eq 0 && "$unknown_count" -eq 0 && "$held_count" -eq 0 ]]; then
+        warning "Nothing in this selection can be removed."
+        gum input --placeholder "Press Enter to continue" >/dev/null
+        return
+    fi
+
+    if [[ "$clearing" -gt 0 ]]; then
+        echo "Removing a worktree deletes its directory. These have no"
+        echo "uncommitted changes, and the branch stays where it is."
+        echo
+
+        if confirm "Remove these $clearing worktrees?"; then
+            echo
+            remove_worktrees_from_list "$proven"
+            remove_worktrees_from_list "$abandoned"
+        else
+            info "Kept all $clearing."
+        fi
+    fi
+
+    if [[ "$unknown_count" -gt 0 ]]; then
+        echo
+        warning "$unknown_count worktree(s) carry no evidence that their work landed."
+        echo "They are clean, so nothing uncommitted is lost, but the branch may"
+        echo "still be unfinished."
+        echo
+
+        if confirm "Remove these $unknown_count as well?"; then
+            remove_worktrees_from_list "$unknown"
+        else
+            info "Kept all $unknown_count."
+        fi
+    fi
+
+    if [[ "$held_count" -gt 0 ]]; then
+        local held_id
+
+        load_ids "$(cat "$held")"
+
+        for held_id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+            review_dirty_worktree "$held_id"
+        done
+    fi
+
+    echo
+    gum input --placeholder "Press Enter to continue" >/dev/null
+}
+
+#
+# Removes a list of worktrees the plan has already authorised. The state is
+# re-read per worktree rather than trusted from the scan, because this is the
+# point where a wrong answer costs uncommitted work.
+#
+remove_worktrees_from_list() {
+    local list="$1"
     local count=0
 
     local id
     local path
     local branch
-    local state
 
-    load_ids "$ids"
+    load_ids "$(cat "$list")"
 
     for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
-        path="$(
-            awk -F '\t' -v id="$id" '$1 == id { print $2 }' "$WORKTREE_DATA"
-        )"
+        path="$(worktree_field "$id" 2)"
+        branch="$(worktree_field "$id" 3)"
 
-        branch="$(
-            awk -F '\t' -v id="$id" '$1 == id { print $3 }' "$WORKTREE_DATA"
-        )"
+        refresh_worktree_list
 
-        state="$(
-            awk -F '\t' -v id="$id" '$1 == id { print $6 }' "$WORKTREE_DATA"
-        )"
-
-        if [[ "$state" != "CLEAN" ]]; then
-            warning "Skipping $branch: worktree is $state."
+        if [[ "$(worktree_state "$path")" != "CLEAN" ]]; then
+            warning "Skipping $branch: the worktree changed since the scan."
             continue
         fi
 
@@ -1469,7 +1755,9 @@ remove_selected_clean_worktrees() {
     git worktree prune
     refresh_worktree_list
 
-    info "Removed $count worktree(s)."
+    [[ "$count" -gt 0 ]] && info "Removed $count worktree(s)."
+
+    return 0
 }
 
 review_dirty_worktree() {
@@ -1541,6 +1829,15 @@ review_dirty_worktree() {
     esac
 }
 
+#
+# One list, one action, matching the branch menu.
+#
+# What stood here asked for a cleanup mode before showing anything — "safe
+# candidates", "all candidates", "dirty / locked", "browse all" — and the buckets
+# overlapped, so there was no right answer to give. The list carries the class
+# and the state, gum filters on both as you type, and the plan decides what
+# happens per worktree.
+#
 worktree_menu() {
     while true; do
         refresh_repository_state_if_stale
@@ -1548,130 +1845,30 @@ worktree_menu() {
         clear
         title "Worktree Cleanup"
 
-        local action
-        action="$(
+        local selected
+        local ids
+
+        selected="$(select_worktrees)" || return
+        [[ -z "$selected" ]] && return
+
+        ids="$(printf '%s\n' "$selected" | selected_ids)"
+
+        local next
+        next="$(
             menu \
-                "Choose a worktree cleanup mode" \
-                "Safe cleanup candidates" \
-                "All cleanup candidates" \
-                "Dirty / locked worktrees" \
-                "Browse all worktrees" \
-                "Back"
+                "$(printf '%s\n' "$ids" | wc -l | tr -d ' ') worktree(s) selected" \
+                "Remove selected" \
+                "Inspect selection" \
+                "Back to the list"
         )"
 
-        case "$action" in
-            "Safe cleanup candidates")
-                local selected
-                local ids
-
-                selected="$(select_worktrees safe)" || continue
-                [[ -z "$selected" ]] && continue
-
-                ids="$(printf '%s\n' "$selected" | selected_ids)"
-
-                local next
-                next="$(
-                    menu \
-                        "Selected worktrees" \
-                        "Remove selected CLEAN worktrees" \
-                        "Inspect selection" \
-                        "Cancel"
-                )"
-
-                case "$next" in
-                    "Remove selected CLEAN worktrees")
-                        show_worktree_details "$ids"
-
-                        if confirm "Remove the selected clean worktrees?"; then
-                            remove_selected_clean_worktrees "$ids"
-                        fi
-                        ;;
-
-                    "Inspect selection")
-                        show_worktree_details "$ids"
-                        ;;
-                esac
+        case "$next" in
+            "Remove selected")
+                plan_worktree_removals "$ids"
                 ;;
 
-            "All cleanup candidates")
-                local selected
-                local ids
-
-                selected="$(select_worktrees candidates)" || continue
-                [[ -z "$selected" ]] && continue
-
-                ids="$(printf '%s\n' "$selected" | selected_ids)"
-
+            "Inspect selection")
                 show_worktree_details "$ids"
-
-                local next
-                next="$(
-                    menu \
-                        "What should happen?" \
-                        "Remove CLEAN worktrees from selection" \
-                        "Review dirty / locked items individually" \
-                        "Cancel"
-                )"
-
-                case "$next" in
-                    "Remove CLEAN worktrees from selection")
-                        if confirm "Remove all CLEAN worktrees in this selection?"; then
-                            remove_selected_clean_worktrees "$ids"
-                        fi
-                        ;;
-
-                    "Review dirty / locked items individually")
-                        local state
-                        local wt_id
-
-                        load_ids "$ids"
-
-                        for wt_id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
-                            state="$(
-                                awk -F '\t' -v id="$wt_id" \
-                                    '$1 == id { print $6 }' \
-                                    "$WORKTREE_DATA"
-                            )"
-
-                            if [[ "$state" != "CLEAN" ]]; then
-                                review_dirty_worktree "$wt_id"
-                            fi
-                        done
-                        ;;
-                esac
-                ;;
-
-            "Dirty / locked worktrees")
-                local selected
-                local ids
-
-                selected="$(select_worktrees dirty)" || continue
-                [[ -z "$selected" ]] && continue
-
-                ids="$(printf '%s\n' "$selected" | selected_ids)"
-
-                local wt_id
-
-                load_ids "$ids"
-
-                for wt_id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
-                    review_dirty_worktree "$wt_id"
-                done
-                ;;
-
-            "Browse all worktrees")
-                local selected
-                local ids
-
-                selected="$(select_worktrees all)" || continue
-                [[ -z "$selected" ]] && continue
-
-                ids="$(printf '%s\n' "$selected" | selected_ids)"
-                show_worktree_details "$ids"
-                ;;
-
-            *)
-                return
                 ;;
         esac
     done
@@ -1682,9 +1879,7 @@ worktree_menu() {
 # -----------------------------------------------------------------------------
 
 branch_display_rows() {
-    local mode="$1"
-
-    awk -F '\t' -v mode="$mode" '
+    awk -F '\t' '
         {
             id=$1
             branch=$2
@@ -1707,14 +1902,6 @@ branch_display_rows() {
             else
                 class = "UNCLEAR"
 
-            #
-            # A branch a worktree has checked out is a candidate like any other
-            # now that deleting it clears the worktree first.
-            #
-            if (mode != "all" && !(mode == "merged" && pr == "merged")) {
-                next
-            }
-
             printf "%s | %-9s | %-7s | %4sd | %s\n",
                 id,
                 class,
@@ -1725,23 +1912,35 @@ branch_display_rows() {
     ' "$BRANCH_DATA"
 }
 
+#
+# Candidates start selected, for the reason the worktree list does: the tool
+# already knows what it would suggest, and Tab-selecting twenty branches out of a
+# filter is the step that stops a cleanup from happening.
+#
 select_branches() {
-    local mode="$1"
     local rows
+    local preselected
 
-    rows="$(branch_display_rows "$mode")"
+    rows="$(branch_display_rows)"
 
     if [[ -z "$rows" ]]; then
-        warning "No matching branches."
+        warning "No local branches besides ${PRIMARY_BRANCH:-the primary branch}."
         gum input --placeholder "Press Enter to continue" >/dev/null
         return 1
     fi
+
+    preselected="$(
+        printf '%s\n' "$rows" |
+            awk -F ' \\| ' '$2 ~ /MERGED|ABANDONED/' |
+            paste -sd, -
+    )"
 
     printf '%s\n' "$rows" |
         gum filter \
             --no-limit \
             --height "$LIST_HEIGHT" \
-            --header "Type MERGED, ABANDONED, UNCLEAR or IN-WT to narrow. Tab selects, Enter confirms." \
+            --selected "$preselected" \
+            --header "Merged and abandoned branches start selected. Tab toggles, Enter confirms. Type MERGED, ABANDONED, UNCLEAR or IN-WT to narrow." \
             --placeholder "Filter branches..."
 }
 
@@ -2315,7 +2514,7 @@ branch_menu() {
         local selected
         local ids
 
-        selected="$(select_branches all)" || return
+        selected="$(select_branches)" || return
         [[ -z "$selected" ]] && return
 
         ids="$(printf '%s\n' "$selected" | selected_ids)"
@@ -2365,126 +2564,44 @@ branch_menu() {
 # The manual paths stay for what this cannot answer: reviewing a single branch,
 # or going after something the ladder files under "unclear".
 #
+#
+# The whole tool in one action.
+#
+# It used to be branch-only while calling itself a repository cleanup, so a
+# worktree whose pull request was merged months ago stayed behind unless it
+# happened to block a branch deletion — and the dashboard counted 20 of those
+# right above the menu entry that would not touch them.
+#
+# Worktrees go first, because removing one is what frees the branch underneath
+# it, so the branch pass then finds nothing pinned.
+#
 clean_up_now() {
     refresh_repository_state_if_stale
 
-    local ids
-    ids="$(cut -f1 "$BRANCH_DATA")"
+    local worktree_ids
+    local branch_ids
 
-    if [[ -z "$ids" ]]; then
+    worktree_ids="$(cut -f1 "$WORKTREE_DATA")"
+    branch_ids="$(cut -f1 "$BRANCH_DATA")"
+
+    if [[ -z "$worktree_ids" && -z "$branch_ids" ]]; then
         clear
         title "Clean Up"
-        success "No local branches besides ${PRIMARY_BRANCH:-the primary branch}."
+        success "Nothing here besides ${PRIMARY_BRANCH:-the primary branch}."
         echo
         gum input --placeholder "Press Enter to continue" >/dev/null
         return
     fi
 
-    delete_selected_branches "$ids"
-}
-
-# -----------------------------------------------------------------------------
-# Guided cleanup
-# -----------------------------------------------------------------------------
-
-guided_cleanup() {
-    while true; do
+    if [[ -n "$worktree_ids" ]]; then
+        plan_worktree_removals "$worktree_ids"
         refresh_repository_state_if_stale
+        branch_ids="$(cut -f1 "$BRANCH_DATA")"
+    fi
 
-        local clean_candidates
-        local merged_branches
-
-        clean_candidates="$(
-            awk -F '\t' -v stale="$STALE_DAYS" '
-                $6 == "CLEAN" &&
-                ($8 == "merged" ||
-                    $7 == "true" ||
-                    ($5 != "?" && $5 >= stale)) {
-                    count++
-                }
-
-                END {
-                    print count+0
-                }
-            ' "$WORKTREE_DATA"
-        )"
-
-        merged_branches="$(
-            awk -F '\t' '
-                $9 == "merged" {
-                    count++
-                }
-
-                END {
-                    print count+0
-                }
-            ' "$BRANCH_DATA"
-        )"
-
-        clear
-        title "Guided Cleanup"
-
-        echo "Recommended cleanup candidates:"
-        echo
-        echo "  Clean worktrees:           $clean_candidates"
-        echo "  Merged-PR local branches:  $merged_branches"
-        echo
-
-        if [[ "$clean_candidates" -eq 0 && "$merged_branches" -eq 0 ]]; then
-            success "No strong cleanup candidates remain."
-            echo
-            gum input --placeholder "Press Enter to return" >/dev/null
-            return
-        fi
-
-        local action
-        action="$(
-            menu \
-                "What should we clean next?" \
-                "Clean worktree candidates" \
-                "Merged-PR local branches" \
-                "Review everything manually" \
-                "Stop guided cleanup"
-        )"
-
-        case "$action" in
-            "Clean worktree candidates")
-                local selected
-                local ids
-
-                selected="$(select_worktrees safe)" || continue
-                [[ -z "$selected" ]] && continue
-
-                ids="$(printf '%s\n' "$selected" | selected_ids)"
-
-                show_worktree_details "$ids"
-
-                if confirm "Remove the selected clean worktrees?"; then
-                    remove_selected_clean_worktrees "$ids"
-                fi
-                ;;
-
-            "Merged-PR local branches")
-                local selected
-                local ids
-
-                selected="$(select_branches merged)" || continue
-                [[ -z "$selected" ]] && continue
-
-                ids="$(printf '%s\n' "$selected" | selected_ids)"
-
-                delete_selected_branches "$ids"
-                ;;
-
-            "Review everything manually")
-                return
-                ;;
-
-            *)
-                return
-                ;;
-        esac
-    done
+    if [[ -n "$branch_ids" ]]; then
+        delete_selected_branches "$branch_ids"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -2559,11 +2676,15 @@ main() {
         git fetch --prune
     fi
 
-    STALE_DAYS="$(
-        input_value \
-            "Number of days after which inactivity is considered stale" \
-            "$DEFAULT_STALE_DAYS"
-    )"
+    #
+    # Only asked for what changes an answer.
+    #
+    # The stale threshold used to be the first of two prompts, before the user
+    # had seen anything at all, and it decides nothing: no branch and no worktree
+    # is classified by age. It is a number on the dashboard, so it takes a
+    # default and an environment variable rather than a prompt.
+    #
+    STALE_DAYS="${GIT_CLEANUP_ASSISTANT_STALE_DAYS:-$DEFAULT_STALE_DAYS}"
 
     if ! [[ "$STALE_DAYS" =~ ^[0-9]+$ ]]; then
         warning "Invalid stale threshold; using $DEFAULT_STALE_DAYS days."
@@ -2593,8 +2714,7 @@ main() {
         action="$(
             menu \
                 "What would you like to do?" \
-                "Clean up now" \
-                "Guided cleanup" \
+                "Clean up everything" \
                 "Worktrees" \
                 "Local branches" \
                 "Refresh Git / GitHub data" \
@@ -2603,12 +2723,8 @@ main() {
         )"
 
         case "$action" in
-            "Clean up now")
+            "Clean up everything")
                 clean_up_now
-                ;;
-
-            "Guided cleanup")
-                guided_cleanup
                 ;;
 
             "Worktrees")
