@@ -193,13 +193,16 @@ as well:
 git cleanup-assistant
 ```
 
-On startup it asks for one setting, the **base ref** that merge checks are measured
-against, default `origin/main`. Nothing else is asked before you have seen the repository.
+On startup it asks for one thing, the **base ref** that merge checks are measured against,
+and only when there is more than one sensible answer. Candidates are the refs that actually
+exist, best first: the remote's own default branch via `origin/HEAD`, then the primary
+branch, then the usual names. Nothing else is asked before you have seen the repository.
 
 Two knobs live in the environment rather than in a prompt:
 
 | Variable | Default | Effect |
 |---|---|---|
+| `GIT_CLEANUP_ASSISTANT_BASE_REF` | chosen | the ref merge state is measured against |
 | `GIT_CLEANUP_ASSISTANT_PROTECTED` | see above | branches never offered for deletion |
 | `GIT_CLEANUP_ASSISTANT_STALE_DAYS` | `30` | the age reported on the dashboard |
 | `GIT_CLEANUP_ASSISTANT_NO_UPDATE_CHECK` | unset | set to `1` to skip the update check |
@@ -234,6 +237,11 @@ bash tests/run.sh
 The suites build their own scratch repositories and never reach a forge, so the no-`gh`
 path is what they exercise by default. CI runs them under Bash 3.2 as well, which is what
 macOS ships and therefore what most people run this with.
+
+They cover the logic, not the terminal. The interactive flow was verified separately by
+driving a real run through a pseudo terminal against a scratch repository — which is how two
+failures were found that no unit test would have reached: `gum input` panicking on an empty
+field, and an unresolvable base ref silently reporting every branch as unclear.
 
 ## Requirements
 
