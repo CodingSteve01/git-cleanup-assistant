@@ -16,7 +16,11 @@ for suite in ./*-test.sh; do
     echo
     echo "── $(basename "$suite")"
 
-    if ! bash "$suite"; then
+    #
+    # stdin is closed for every suite: a test that waits for input is a test
+    # that hangs a CI run, and nothing here should ever read from a terminal.
+    #
+    if ! bash "$suite" < /dev/null; then
         status=1
     fi
 done

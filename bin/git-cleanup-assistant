@@ -1020,15 +1020,49 @@ selected_ids() {
     sed -E 's/^([^ ]+).*/\1/'
 }
 
+#
+# Reads a newline separated list of ids into SELECTED_IDS, so callers can walk a
+# selection with a for loop.
+#
+# This exists because `while read ... done < list` is the wrong shape for a loop
+# whose body asks a question. The loop owns stdin for as long as it runs, so the
+# first gum prompt inside it reads the remaining ids as keystrokes, answers
+# itself with them and returns instantly for everything after the first entry.
+# Selecting twenty branches and watching one of them disappear was that bug, not
+# a deletion that was refused. An array holds the list without holding stdin.
+#
+load_ids() {
+    local raw="$1"
+    local line
+
+    SELECTED_IDS=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        SELECTED_IDS[${#SELECTED_IDS[@]}]="$line"
+    done <<< "$raw"
+}
+
+#
+# `set -u` treats an empty array as unset in Bash 3.2, which is the version
+# macOS ships, so every expansion of a possibly empty selection goes through
+# this instead of "${SELECTED_IDS[@]}".
+#
+selected_count() {
+    echo "${#SELECTED_IDS[@]}"
+}
+
 show_worktree_details() {
     local ids="$1"
     local detail_file="$TMP_ROOT/worktree-details.txt"
 
     : > "$detail_file"
 
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
+    local id
 
+    load_ids "$ids"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
         awk -F '\t' -v id="$id" '
             $1 == id {
                 print "────────────────────────────────────────────────────────────"
@@ -1070,8 +1104,7 @@ show_worktree_details() {
 
             echo >> "$detail_file"
         fi
-
-    done <<< "$ids"
+    done
 
     gum pager < "$detail_file"
 }
@@ -1080,13 +1113,14 @@ remove_selected_clean_worktrees() {
     local ids="$1"
     local count=0
 
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
+    local id
+    local path
+    local branch
+    local state
 
-        local path
-        local branch
-        local state
+    load_ids "$ids"
 
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
         path="$(
             awk -F '\t' -v id="$id" '$1 == id { print $2 }' "$WORKTREE_DATA"
         )"
@@ -1110,7 +1144,7 @@ remove_selected_clean_worktrees() {
         else
             warning "Could not remove: $branch"
         fi
-    done <<< "$ids"
+    done
 
     git worktree prune
 
@@ -1264,20 +1298,22 @@ worktree_menu() {
                         ;;
 
                     "Review dirty / locked items individually")
-                        while IFS= read -r id; do
-                            [[ -z "$id" ]] && continue
+                        local state
+                        local wt_id
 
-                            local state
+                        load_ids "$ids"
+
+                        for wt_id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
                             state="$(
-                                awk -F '\t' -v id="$id" \
+                                awk -F '\t' -v id="$wt_id" \
                                     '$1 == id { print $6 }' \
                                     "$WORKTREE_DATA"
                             )"
 
                             if [[ "$state" != "CLEAN" ]]; then
-                                review_dirty_worktree "$id"
+                                review_dirty_worktree "$wt_id"
                             fi
-                        done <<< "$ids"
+                        done
                         ;;
                 esac
                 ;;
@@ -1291,10 +1327,13 @@ worktree_menu() {
 
                 ids="$(printf '%s\n' "$selected" | selected_ids)"
 
-                while IFS= read -r id; do
-                    [[ -z "$id" ]] && continue
-                    review_dirty_worktree "$id"
-                done <<< "$ids"
+                local wt_id
+
+                load_ids "$ids"
+
+                for wt_id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+                    review_dirty_worktree "$wt_id"
+                done
                 ;;
 
             "Browse all worktrees")
@@ -1389,11 +1428,12 @@ show_branch_details() {
 
     : > "$detail_file"
 
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
+    local id
+    local branch
 
-        local branch
+    load_ids "$ids"
 
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
         branch="$(
             awk -F '\t' -v id="$id" '$1 == id { print $2 }' "$BRANCH_DATA"
         )"
@@ -1432,8 +1472,7 @@ show_branch_details() {
             >> "$detail_file" 2>&1 || true
 
         echo >> "$detail_file"
-
-    done <<< "$ids"
+    done
 
     gum pager < "$detail_file"
 }
@@ -1622,13 +1661,14 @@ write_evidence_table() {
             "--------" "----" "------" "--------" "------"
     } > "$report"
 
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
+    local id
+    local branch
+    local gone
+    local pr
 
-        local branch
-        local gone
-        local pr
+    load_ids "$ids"
 
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
         branch="$(branch_field "$id" 2)"
         gone="$(branch_field "$id" 6)"
         pr="$(branch_field "$id" 9)"
@@ -1640,7 +1680,7 @@ write_evidence_table() {
             "$(commits_not_on_base "$branch")" \
             "$branch" \
             >> "$report"
-    done <<< "$ids"
+    done
 }
 
 #
@@ -1668,10 +1708,12 @@ delete_selected_branches() {
 
     local blocked=0
 
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
+    local id
+    local class
 
-        local class
+    load_ids "$ids"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
         class="$(classify_branch "$id")"
 
         [[ "$class" == *:WT ]] && blocked=$((blocked + 1))
@@ -1682,7 +1724,7 @@ delete_selected_branches() {
             ABANDONED) echo "$id" >> "$abandoned" ;;
             UNKNOWN)   echo "$id" >> "$unknown" ;;
         esac
-    done <<< "$ids"
+    done
 
     local proven_count
     local abandoned_count
@@ -1772,15 +1814,17 @@ run_confirmed_deletions() {
     local list="$1"
     local reason="$2"
 
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
+    local id
+    local branch
 
-        local branch
+    load_ids "$(cat "$list")"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
         branch="$(branch_field "$id" 2)"
 
         remove_blocking_worktree "$branch" || continue
         force_delete_branch "$branch" "$reason"
-    done < "$list"
+    done
 }
 
 #
@@ -1823,15 +1867,17 @@ run_forced_deletions() {
         return
     fi
 
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
+    local id
+    local branch
 
-        local branch
+    load_ids "$(cat "$list")"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
         branch="$(branch_field "$id" 2)"
 
         remove_blocking_worktree "$branch" || continue
         force_delete_branch "$branch"
-    done < "$list"
+    done
 }
 
 review_branch_individually() {
@@ -1958,10 +2004,13 @@ branch_menu() {
                 ;;
 
             "Review selected individually")
-                while IFS= read -r id; do
-                    [[ -z "$id" ]] && continue
-                    review_branch_individually "$id"
-                done <<< "$ids"
+                local branch_id
+
+                load_ids "$ids"
+
+                for branch_id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+                    review_branch_individually "$branch_id"
+                done
                 ;;
         esac
     done
