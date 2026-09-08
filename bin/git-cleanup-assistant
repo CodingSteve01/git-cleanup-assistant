@@ -55,37 +55,9 @@ trap cleanup_tmp EXIT INT TERM
 WORKTREE_DATA="$TMP_ROOT/worktrees.tsv"
 BRANCH_DATA="$TMP_ROOT/branches.tsv"
 PR_CACHE="$TMP_ROOT/pr-cache.tsv"
-PR_DEDUPE_AWK="$TMP_ROOT/pr-dedupe.awk"
-
-#
-# One branch head can carry several pull requests over its lifetime: a merged one
-# and, later, a closed re-open or a revert experiment. Keeping the newest would
-# report "closed" for a branch that is in fact merged, and the assistant would
-# then refuse the very deletion the user asked for. A merged pull request wins.
-#
-cat > "$PR_DEDUPE_AWK" <<'AWK'
-BEGIN { FS = "\t" }
-
-{
-    if (!($1 in best)) {
-        order[++n] = $1
-        best[$1] = $0
-        merged[$1] = ($2 == "merged")
-        next
-    }
-
-    if ($2 == "merged" && !merged[$1]) {
-        best[$1] = $0
-        merged[$1] = 1
-    }
-}
-
-END {
-    for (i = 1; i <= n; i++) {
-        print best[order[i]]
-    }
-}
-AWK
+PR_QUERY="$TMP_ROOT/pr-query.graphql"
+PR_RESPONSE="$TMP_ROOT/pr-response.json"
+PR_HEADS="$TMP_ROOT/pr-heads.txt"
 
 # -----------------------------------------------------------------------------
 # Formatting
@@ -460,6 +432,8 @@ initialize_repository() {
     )"
 
     REPO_SLUG=""
+    REPO_OWNER=""
+    REPO_NAME=""
 
     if [[ "$GH_AVAILABLE" == true ]]; then
         REPO_SLUG="$(
@@ -468,6 +442,9 @@ initialize_repository() {
                 --jq '.nameWithOwner' \
                 2>/dev/null || true
         )"
+
+        REPO_OWNER="${REPO_SLUG%%/*}"
+        REPO_NAME="${REPO_SLUG##*/}"
     fi
 }
 
@@ -475,45 +452,176 @@ initialize_repository() {
 # GitHub PR cache
 # -----------------------------------------------------------------------------
 
+#
+# How many branch heads go into one GraphQL request.
+#
+# The query carries one aliased field per branch, so the request grows with the
+# number of branches asked about. Fifty keeps a request small enough to stay well
+# inside GitHub's node limit while still turning a normal repository into a
+# single round trip.
+#
+PR_QUERY_BATCH_SIZE=50
+
+#
+# GraphQL string literals take the branch name verbatim, so the two characters
+# that could end the literal early are escaped here.
+#
+escape_for_graphql() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+#
+# Collects the branch heads worth asking about: the local branches, which is
+# also every branch a worktree can have checked out.
+#
+collect_pr_heads() {
+    git for-each-ref --format='%(refname:short)' refs/heads > "$PR_HEADS"
+}
+
+#
+# Asks GitHub about one batch of branch heads in a single request.
+#
+# pullRequests(headRefName:) is the field that makes this work. Looking the
+# branch up as a ref would find nothing for exactly the branches that matter
+# here, because a merged pull request usually takes its remote branch with it.
+# A pull request keeps its head ref name forever.
+#
+# Merged wins over the newest. One branch head can carry several pull requests
+# over its lifetime, and a closed re-open or a revert experiment created after
+# the merge would otherwise report "closed" for work that is on main, which is
+# how the assistant ends up refusing the very deletion it was asked for.
+#
+query_pr_batch() {
+    local first="$1"
+    local last="$2"
+
+    local index="$first"
+    local branch
+    local escaped
+
+    {
+        printf 'query {\n'
+        printf '  repository(owner: "%s", name: "%s") {\n' \
+            "$REPO_OWNER" "$REPO_NAME"
+
+        while [[ "$index" -le "$last" ]]; do
+            branch="$(sed -n "${index}p" "$PR_HEADS")"
+
+            [[ -z "$branch" ]] && { index=$((index + 1)); continue; }
+
+            escaped="$(escape_for_graphql "$branch")"
+
+            printf '    b%s: pullRequests(headRefName: "%s", first: 10, states: [OPEN, CLOSED, MERGED], orderBy: {field: CREATED_AT, direction: DESC}) { nodes { number state url merged } }\n' \
+                "$index" "$escaped"
+
+            index=$((index + 1))
+        done
+
+        printf '  }\n'
+        printf '}\n'
+    } > "$PR_QUERY"
+
+    #
+    # Filtered by gh's own --jq rather than a jq binary, so this adds no
+    # dependency the assistant did not already have.
+    #
+    # Aliases carry the line number the branch had in PR_HEADS, which is how an
+    # answer finds its way back to a name without that name having to survive a
+    # round trip through GraphQL field syntax.
+    #
+    # $line and $pr below are jq bindings, not shell variables.
+    # shellcheck disable=SC2016
+    gh api graphql -F query=@"$PR_QUERY" --jq '
+        .data.repository // {}
+        | to_entries[]
+        | select(.value.nodes | length > 0)
+        | .key[1:] as $line
+        | (
+            (.value.nodes | map(select(.merged == true)) | first)
+            // .value.nodes[0]
+          ) as $pr
+        | [
+            $line,
+            (if $pr.merged then "merged" else ($pr.state | ascii_downcase) end),
+            ($pr.number | tostring),
+            $pr.url
+          ]
+        | @tsv
+    ' > "$PR_RESPONSE" 2>/dev/null || return 1
+
+    local line
+    local state
+    local number
+    local url
+
+    while IFS=$'\t' read -r line state number url; do
+        [[ -z "$line" ]] && continue
+
+        printf '%s\t%s\t%s\t%s\n' \
+            "$(sed -n "${line}p" "$PR_HEADS")" "$state" "$number" "$url"
+    done < "$PR_RESPONSE" >> "$PR_CACHE"
+}
+
+#
+# Asks the forge about the branches that exist here, rather than downloading the
+# repository's pull request history.
+#
+# Listing every pull request cost one request per hundred of them, forever, and
+# it bought nothing: a repository with 2500 pull requests and 70 local branches
+# spent seventeen seconds fetching 2430 answers about branches that are not on
+# this machine, on every start and every refresh. The cost now follows the number
+# of local branches, which is the number the user can actually see.
+#
+# Everything here is optional by design. A failed request leaves the cache empty
+# and the run continues on git evidence alone, which is the same path a machine
+# without gh takes.
+#
 refresh_pr_cache() {
     : > "$PR_CACHE"
 
-    if [[ "$GH_AVAILABLE" != true || -z "$REPO_SLUG" ]]; then
+    if [[ "$GH_AVAILABLE" != true || -z "$REPO_OWNER" || -z "$REPO_NAME" ]]; then
         return
     fi
 
-    #
-    # Fetch all PRs once and cache the newest PR per head branch.
-    #
-    # This avoids one GitHub request per branch/worktree and therefore scales
-    # much better for repositories with many local branches.
-    #
-    # GitHub returns 100 PRs per page. gh --paginate follows all pages.
-    #
+    collect_pr_heads
 
-    gum spin \
-        --spinner dot \
-        --title "Loading GitHub pull request metadata..." \
-        -- \
-        bash -c "
-            gh api --paginate \
-                'repos/$REPO_SLUG/pulls?state=all&sort=created&direction=desc&per_page=100' \
-                --jq '.[] |
-                    [
-                        .head.ref,
-                        (if .merged_at != null then \"merged\" else .state end),
-                        (.number | tostring),
-                        .html_url
-                    ] |
-                    @tsv' \
-            | awk -f '$PR_DEDUPE_AWK' \
-            > '$PR_CACHE'
-        "
+    local total
+    total=$(count_rows "$PR_HEADS")
 
-    local count
-    count=$(wc -l < "$PR_CACHE" | tr -d ' ')
+    if [[ "$total" -eq 0 ]]; then
+        return
+    fi
 
-    info "Cached GitHub metadata for $count branch heads."
+    local first=1
+    local last
+    local failed=0
+
+    while [[ "$first" -le "$total" ]]; do
+        last=$((first + PR_QUERY_BATCH_SIZE - 1))
+        [[ "$last" -gt "$total" ]] && last="$total"
+
+        #
+        # Printed rather than spun, because a spinner has to wrap the work to
+        # mean anything and gum spin cannot call a shell function. A batch is
+        # one request, so the line moves at the speed of the work behind it.
+        #
+        if [[ "$total" -gt "$PR_QUERY_BATCH_SIZE" ]]; then
+            printf '\r  Reading pull request state: %s-%s of %s' \
+                "$first" "$last" "$total"
+        fi
+
+        query_pr_batch "$first" "$last" || failed=$((failed + 1))
+
+        first=$((last + 1))
+    done
+
+    [[ "$total" -gt "$PR_QUERY_BATCH_SIZE" ]] && printf '\r%*s\r' 60 ""
+
+    if [[ "$failed" -gt 0 ]]; then
+        warning "$failed pull request request(s) failed; classification falls back to git."
+    fi
+
+    info "Read pull request state for $(count_rows "$PR_CACHE") of $total local branches."
 }
 
 pr_info_for_branch() {
