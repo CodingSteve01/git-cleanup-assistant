@@ -13,20 +13,23 @@ losing work you still need.
 - Lists worktrees and local branches with age, state, upstream status and pull request status
 - Detects squash merges from git alone, by patch id, with no forge involved
 - Detects merged pull requests through the GitHub API when `gh` is available
-- Multi-select with fuzzy search, so you can pick 20 branches in one pass
-- One action cleans up the whole repository: an evidence ladder decides per branch, a plan
-  says what will happen, one confirmation carries it out
+- One action cleans up the whole repository — worktrees and branches: an evidence ladder
+  decides per item, a plan says what will happen, one confirmation carries it out
+- Candidates start selected, so a cleanup is deselecting what you want to keep rather than
+  Tab-selecting twenty entries out of a filter
+- Never touches a protected branch, whatever the evidence says
 - Clears the worktree that pins a branch as part of deleting it, instead of sending you to
   another menu
 - Bulk force deletion for branches Git will never call merged, gated behind an evidence table
-- Guided cleanup that goes straight for the obvious candidates
-- Caches pull request metadata once per run instead of querying per branch
+- Asks the forge only about the branches that exist locally, so startup does not scale with
+  the repository's pull request history
 - Checks once a day whether a newer release exists and can upgrade itself via Homebrew
 
 ## How deleting works
 
-**Clean up now** takes every local branch, no list to work through first, and shows the
-plan before it touches anything:
+**Clean up everything** takes every worktree and every local branch, no list to work
+through first, and shows the plan before it touches anything. Worktrees go first, because
+removing one is what frees the branch underneath it:
 
 ```
 Deletion Plan
@@ -44,6 +47,11 @@ Deletion Plan
   4 of these need a worktree removed first, confirmed one by one
 ```
 
+Worktrees are classified by the same ladder, reading the merge evidence of the branch they
+hold, and removed through a plan of the same shape. Dirty and locked worktrees are carried
+as a state rather than a class: they are never removed in bulk, whatever the evidence says
+about the branch, and are reviewed one at a time.
+
 One confirmation covers everything with evidence behind it. Only **unclear** is held back
 behind an evidence table and a typed `DELETE`. Any worktree in the way is confirmed on its
 own before it is removed, and every deleted branch prints the command that brings it back.
@@ -52,6 +60,7 @@ Each branch is placed by an evidence ladder, strongest rung first:
 
 | Rung | Means | Source |
 |---|---|---|
+| **protected** | the branch outlives the work merged out of it | configuration |
 | **merged** | the tip is an ancestor of the base ref | git |
 | **merged** | rolled into one commit, its patch is already on the base ref | git |
 | **merged** | a merged pull request | forge |
@@ -66,15 +75,34 @@ The **abandoned** rung is not proof that the work landed. Deleting the remote br
 deliberate act by whoever deleted it, and carrying out that decision is what this tool is
 for — which is why it needs one confirmation rather than a typed `DELETE`.
 
-Prefer picking branches by hand? **Local branches** opens the same list with the same
-classes; typing `MERGED`, `ABANDONED`, `UNCLEAR` or `IN-WT` narrows it, and **Delete
-selected** runs the same plan over your selection.
+Prefer picking things by hand? **Local branches** and **Worktrees** open the same lists
+with the same classes; typing `MERGED`, `ABANDONED`, `UNCLEAR`, `PROTECTED` or `IN-WT`
+narrows them, and the delete and remove actions run the same plans over your selection.
+
+## Protected branches
+
+A release branch is merged into the base ref and then carries on being a release branch.
+Every rung of the ladder reports it as finished and every one of them is right — the
+conclusion is what is wrong. Protected branches sit above the whole ladder: labelled as
+such in both lists, never pre-selected, listed under *kept* in the plan, and refused by the
+deletion itself.
+
+The default covers `main`, `master`, `develop`, `development`, `staging`, `production`,
+`release/*` and `support/*`. It is a default, not a policy — the answer belongs to the
+repository:
+
+```sh
+git config cleanup-assistant.protected '^(main|release/.*|integration)$'
+```
+
+`GIT_CLEANUP_ASSISTANT_PROTECTED` overrides that for a single run.
 
 ## Safety rules
 
 The whole point is that a bulk delete stays boring. These rules are enforced in code:
 
 - The primary worktree and its branch are never removed
+- A protected branch is never deleted, and neither is the worktree that holds it
 - Dirty worktrees are never bulk deleted; removing one needs a typed `DELETE` confirmation
 - A branch checked out in a worktree is never deleted behind your back; the assistant
   offers to remove the worktree first and confirms that removal separately
@@ -165,11 +193,55 @@ as well:
 git cleanup-assistant
 ```
 
-On startup it asks for two settings:
+On startup it asks for one thing, the **base ref** that merge checks are measured against,
+and only when there is more than one sensible answer. Candidates are the refs that actually
+exist, best first: the remote's own default branch via `origin/HEAD`, then the primary
+branch, then the usual names. Nothing else is asked before you have seen the repository.
 
-- **Stale threshold** in days, default `30` — how long a branch may sit without commits
-  before it shows up as a candidate
-- **Base ref** for merge checks, default `origin/main`
+Two knobs live in the environment rather than in a prompt:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `GIT_CLEANUP_ASSISTANT_BASE_REF` | chosen | the ref merge state is measured against |
+| `GIT_CLEANUP_ASSISTANT_PROTECTED` | see above | branches never offered for deletion |
+| `GIT_CLEANUP_ASSISTANT_STALE_DAYS` | `30` | the age reported on the dashboard |
+| `GIT_CLEANUP_ASSISTANT_NO_UPDATE_CHECK` | unset | set to `1` to skip the update check |
+
+## Large repositories
+
+Startup used to list the repository's entire pull request history, one request per hundred
+entries. With 2500 pull requests and 70 local branches that is 26 requests spent learning
+about 2430 branches that are not on the machine, paid again on every refresh — the cost
+scaled with the repository's age rather than with anything the user could see.
+
+It now asks about the branches that exist locally, up to fifty per GraphQL request, so a
+normal repository is one round trip. Scanning was reworked the same way: worktree metadata
+comes from one `git for-each-ref` instead of three git processes per worktree, the porcelain
+worktree list is read once per scan instead of once per lookup, `git status` runs a few
+worktrees at a time, and menus only rescan when something actually changed.
+
+Measured on a repository with 36 worktrees, 71 branches and 2500 pull requests:
+
+| | before | after |
+|---|---|---|
+| Pull request metadata | 17.4s | 2.1s |
+| Repository scan | 71s | 11s |
+| Scan per menu pass | every time | only after a change |
+
+## Tests
+
+```sh
+bash tests/run.sh
+```
+
+The suites build their own scratch repositories and never reach a forge, so the no-`gh`
+path is what they exercise by default. CI runs them under Bash 3.2 as well, which is what
+macOS ships and therefore what most people run this with.
+
+They cover the logic, not the terminal. The interactive flow was verified separately by
+driving a real run through a pseudo terminal against a scratch repository — which is how two
+failures were found that no unit test would have reached: `gum input` panicking on an empty
+field, and an unresolvable base ref silently reporting every branch as unclear.
 
 ## Requirements
 

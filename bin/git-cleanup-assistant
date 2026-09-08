@@ -31,9 +31,21 @@ set -u
 #
 VERSION="0.3.0" # x-release-please-version
 
+#
+# Branches that outlive the work merged out of them.
+#
+# A release branch is merged into main and then carries on, so every rung of the
+# ladder reports it as finished and it is exactly the kind of branch a bulk
+# cleanup must never touch. The same is true of develop, staging and the long
+# lived integration branches teams keep.
+#
+# This is a default, not a policy: `git config cleanup-assistant.protected
+# '<regex>'` sets it per repository, which is where the answer actually lives.
+#
+DEFAULT_PROTECTED_PATTERN='^(main|master|develop|development|staging|production|release/.*|support/.*)$'
+
 DEFAULT_STALE_DAYS=30
 DEFAULT_HEIGHT=24
-DEFAULT_BASE_REF="origin/main"
 
 UPDATE_REPOSITORY="CodingSteve01/git-cleanup-assistant"
 UPDATE_FORMULA="CodingSteve01/tap/git-cleanup-assistant"
@@ -53,39 +65,13 @@ cleanup_tmp() {
 trap cleanup_tmp EXIT INT TERM
 
 WORKTREE_DATA="$TMP_ROOT/worktrees.tsv"
+WORKTREE_LIST="$TMP_ROOT/worktree-list.txt"
+REF_DATA="$TMP_ROOT/refs.tsv"
 BRANCH_DATA="$TMP_ROOT/branches.tsv"
 PR_CACHE="$TMP_ROOT/pr-cache.tsv"
-PR_DEDUPE_AWK="$TMP_ROOT/pr-dedupe.awk"
-
-#
-# One branch head can carry several pull requests over its lifetime: a merged one
-# and, later, a closed re-open or a revert experiment. Keeping the newest would
-# report "closed" for a branch that is in fact merged, and the assistant would
-# then refuse the very deletion the user asked for. A merged pull request wins.
-#
-cat > "$PR_DEDUPE_AWK" <<'AWK'
-BEGIN { FS = "\t" }
-
-{
-    if (!($1 in best)) {
-        order[++n] = $1
-        best[$1] = $0
-        merged[$1] = ($2 == "merged")
-        next
-    }
-
-    if ($2 == "merged" && !merged[$1]) {
-        best[$1] = $0
-        merged[$1] = 1
-    }
-}
-
-END {
-    for (i = 1; i <= n; i++) {
-        print best[order[i]]
-    }
-}
-AWK
+PR_QUERY="$TMP_ROOT/pr-query.graphql"
+PR_RESPONSE="$TMP_ROOT/pr-response.json"
+PR_HEADS="$TMP_ROOT/pr-heads.txt"
 
 # -----------------------------------------------------------------------------
 # Formatting
@@ -152,6 +138,41 @@ confirm() {
     gum confirm "$1"
 }
 
+#
+# gum input is not used anywhere in this script, and that is deliberate.
+#
+# In gum 2.0.0 it panics the moment its field is empty — which is the state every
+# "Press Enter to continue" starts in, and the state every "Type DELETE" prompt
+# starts in. The user got a Go stack trace where the assistant meant to pause,
+# and the typed confirmation that guards the destructive paths could not be
+# answered at all. gum confirm, gum choose, gum filter and gum pager are fine and
+# still do the interesting work.
+#
+# read is a shell builtin, so these two cannot break with a gum release either.
+#
+pause() {
+    printf '%s' "Press Enter to continue"
+
+    # A closed stdin (a piped or non-interactive run) must not block the script.
+    read -r _ || true
+
+    echo
+}
+
+#
+# Prompts on stderr so the answer alone reaches the caller through a command
+# substitution.
+#
+prompt_for_line() {
+    local answer
+
+    printf '%s' "$1" >&2
+
+    read -r answer || answer=""
+
+    printf '%s' "$answer"
+}
+
 menu() {
     local header="$1"
     shift
@@ -162,31 +183,26 @@ menu() {
             --header "$header"
 }
 
-input_value() {
-    local placeholder="$1"
-    local value="$2"
-
-    gum input \
-        --placeholder "$placeholder" \
-        --value "$value"
-}
-
 plural_verb() {
     [[ "$1" -eq 1 ]] && echo "needs" || echo "need"
 }
 
+#
+# Set once per scan by refresh_repository_state. Reading the clock per branch and
+# per worktree started a process for every age in the list and could not report a
+# different answer.
+#
+NOW_EPOCH="$(date +%s)"
+
 age_in_days() {
     local epoch="$1"
-    local now
-
-    now=$(date +%s)
 
     if [[ -z "$epoch" || "$epoch" == "0" ]]; then
         echo "?"
         return
     fi
 
-    echo $(( (now - epoch) / 86400 ))
+    echo $(( (NOW_EPOCH - epoch) / 86400 ))
 }
 
 # -----------------------------------------------------------------------------
@@ -411,7 +427,7 @@ check_for_update() {
 
     if ! installed_via_homebrew; then
         info "This copy is not managed by Homebrew; update it the way you installed it."
-        gum input --placeholder "Press Enter to continue" >/dev/null
+        pause
         return
     fi
 
@@ -421,7 +437,7 @@ check_for_update() {
 
     if ! brew upgrade "$UPDATE_FORMULA"; then
         warning "The update failed; continuing with $VERSION."
-        gum input --placeholder "Press Enter to continue" >/dev/null
+        pause
         return
     fi
 
@@ -445,10 +461,118 @@ check_for_update() {
 # Repository information
 # -----------------------------------------------------------------------------
 
+#
+# Repository configuration wins over the built-in default, and the environment
+# wins over both, so a one-off run can widen or narrow it without editing config.
+#
+resolve_protected_pattern() {
+    local configured
+
+    if [[ -n "${GIT_CLEANUP_ASSISTANT_PROTECTED:-}" ]]; then
+        PROTECTED_PATTERN="$GIT_CLEANUP_ASSISTANT_PROTECTED"
+        return
+    fi
+
+    configured="$(git config --get cleanup-assistant.protected 2>/dev/null || true)"
+
+    if [[ -n "$configured" ]]; then
+        PROTECTED_PATTERN="$configured"
+        return
+    fi
+
+    PROTECTED_PATTERN="$DEFAULT_PROTECTED_PATTERN"
+}
+
+branch_is_protected() {
+    local branch="$1"
+
+    [[ -n "$branch" ]] || return 1
+    [[ "$branch" == "(detached)" ]] && return 1
+
+    printf '%s' "$branch" | grep -Eq "${PROTECTED_PATTERN:-$DEFAULT_PROTECTED_PATTERN}"
+}
+
+#
+# Collects the refs a merge check could sensibly be measured against, best first,
+# and keeps only the ones that exist.
+#
+# origin/HEAD is asked first because it names the remote's default branch, which
+# is the right answer in a repository whose main branch is called something else.
+#
+base_ref_candidates() {
+    {
+        git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true
+
+        [[ -n "$PRIMARY_BRANCH" ]] && printf 'origin/%s\n%s\n' \
+            "$PRIMARY_BRANCH" "$PRIMARY_BRANCH"
+
+        printf '%s\n' origin/main origin/master main master
+    } |
+        awk 'NF && !seen[$0]++' |
+        while IFS= read -r ref; do
+            git rev-parse --verify --quiet "$ref^{commit}" >/dev/null 2>&1 &&
+                printf '%s\n' "$ref"
+        done
+}
+
+#
+# Chosen from what exists rather than typed.
+#
+# Typing it had two failure modes and hit both. gum 2.0.0 panics when the input
+# field is emptied — clearing the pre-filled value to type a different ref kills
+# the prompt — and an unverifiable answer fell back to DEFAULT_BASE_REF, which is
+# the same origin/main that had just failed to resolve. A repository without that
+# ref then measured every branch against something that does not exist, found no
+# evidence anywhere, and called all of them unclear.
+#
+choose_base_ref() {
+    local candidates
+    local count
+
+    candidates="$(base_ref_candidates)"
+
+    if [[ -z "$candidates" ]]; then
+        warning "No usable base ref found; falling back to HEAD."
+        BASE_REF="HEAD"
+        return
+    fi
+
+    count=$(printf '%s\n' "$candidates" | wc -l | tr -d ' ')
+
+    #
+    # Nothing to decide when there is one answer, so it is not asked.
+    #
+    if [[ "$count" -eq 1 ]]; then
+        BASE_REF="$candidates"
+        info "Measuring merge state against $BASE_REF."
+        return
+    fi
+
+    BASE_REF="$(
+        printf '%s\n' "$candidates" |
+            gum choose \
+                --height "$MENU_HEIGHT" \
+                --header "Measure merge state against which ref?"
+    )"
+
+    #
+    # gum exits empty when the choice is cancelled; the best candidate is the
+    # right answer for someone who did not want to pick one.
+    #
+    if [[ -z "$BASE_REF" ]]; then
+        BASE_REF="$(printf '%s\n' "$candidates" | head -1)"
+    fi
+}
+
 initialize_repository() {
     require_git_repository
 
     REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+    resolve_protected_pattern
+
+    # So the shared lookups have a file to read before the first scan runs.
+    refresh_worktree_list
 
     PRIMARY_WORKTREE="$(
         git worktree list --porcelain |
@@ -460,6 +584,8 @@ initialize_repository() {
     )"
 
     REPO_SLUG=""
+    REPO_OWNER=""
+    REPO_NAME=""
 
     if [[ "$GH_AVAILABLE" == true ]]; then
         REPO_SLUG="$(
@@ -468,6 +594,9 @@ initialize_repository() {
                 --jq '.nameWithOwner' \
                 2>/dev/null || true
         )"
+
+        REPO_OWNER="${REPO_SLUG%%/*}"
+        REPO_NAME="${REPO_SLUG##*/}"
     fi
 }
 
@@ -475,45 +604,176 @@ initialize_repository() {
 # GitHub PR cache
 # -----------------------------------------------------------------------------
 
+#
+# How many branch heads go into one GraphQL request.
+#
+# The query carries one aliased field per branch, so the request grows with the
+# number of branches asked about. Fifty keeps a request small enough to stay well
+# inside GitHub's node limit while still turning a normal repository into a
+# single round trip.
+#
+PR_QUERY_BATCH_SIZE=50
+
+#
+# GraphQL string literals take the branch name verbatim, so the two characters
+# that could end the literal early are escaped here.
+#
+escape_for_graphql() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+#
+# Collects the branch heads worth asking about: the local branches, which is
+# also every branch a worktree can have checked out.
+#
+collect_pr_heads() {
+    git for-each-ref --format='%(refname:short)' refs/heads > "$PR_HEADS"
+}
+
+#
+# Asks GitHub about one batch of branch heads in a single request.
+#
+# pullRequests(headRefName:) is the field that makes this work. Looking the
+# branch up as a ref would find nothing for exactly the branches that matter
+# here, because a merged pull request usually takes its remote branch with it.
+# A pull request keeps its head ref name forever.
+#
+# Merged wins over the newest. One branch head can carry several pull requests
+# over its lifetime, and a closed re-open or a revert experiment created after
+# the merge would otherwise report "closed" for work that is on main, which is
+# how the assistant ends up refusing the very deletion it was asked for.
+#
+query_pr_batch() {
+    local first="$1"
+    local last="$2"
+
+    local index="$first"
+    local branch
+    local escaped
+
+    {
+        printf 'query {\n'
+        printf '  repository(owner: "%s", name: "%s") {\n' \
+            "$REPO_OWNER" "$REPO_NAME"
+
+        while [[ "$index" -le "$last" ]]; do
+            branch="$(sed -n "${index}p" "$PR_HEADS")"
+
+            [[ -z "$branch" ]] && { index=$((index + 1)); continue; }
+
+            escaped="$(escape_for_graphql "$branch")"
+
+            printf '    b%s: pullRequests(headRefName: "%s", first: 10, states: [OPEN, CLOSED, MERGED], orderBy: {field: CREATED_AT, direction: DESC}) { nodes { number state url merged } }\n' \
+                "$index" "$escaped"
+
+            index=$((index + 1))
+        done
+
+        printf '  }\n'
+        printf '}\n'
+    } > "$PR_QUERY"
+
+    #
+    # Filtered by gh's own --jq rather than a jq binary, so this adds no
+    # dependency the assistant did not already have.
+    #
+    # Aliases carry the line number the branch had in PR_HEADS, which is how an
+    # answer finds its way back to a name without that name having to survive a
+    # round trip through GraphQL field syntax.
+    #
+    # $line and $pr below are jq bindings, not shell variables.
+    # shellcheck disable=SC2016
+    gh api graphql -F query=@"$PR_QUERY" --jq '
+        .data.repository // {}
+        | to_entries[]
+        | select(.value.nodes | length > 0)
+        | .key[1:] as $line
+        | (
+            (.value.nodes | map(select(.merged == true)) | first)
+            // .value.nodes[0]
+          ) as $pr
+        | [
+            $line,
+            (if $pr.merged then "merged" else ($pr.state | ascii_downcase) end),
+            ($pr.number | tostring),
+            $pr.url
+          ]
+        | @tsv
+    ' > "$PR_RESPONSE" 2>/dev/null || return 1
+
+    local line
+    local state
+    local number
+    local url
+
+    while IFS=$'\t' read -r line state number url; do
+        [[ -z "$line" ]] && continue
+
+        printf '%s\t%s\t%s\t%s\n' \
+            "$(sed -n "${line}p" "$PR_HEADS")" "$state" "$number" "$url"
+    done < "$PR_RESPONSE" >> "$PR_CACHE"
+}
+
+#
+# Asks the forge about the branches that exist here, rather than downloading the
+# repository's pull request history.
+#
+# Listing every pull request cost one request per hundred of them, forever, and
+# it bought nothing: a repository with 2500 pull requests and 70 local branches
+# spent seventeen seconds fetching 2430 answers about branches that are not on
+# this machine, on every start and every refresh. The cost now follows the number
+# of local branches, which is the number the user can actually see.
+#
+# Everything here is optional by design. A failed request leaves the cache empty
+# and the run continues on git evidence alone, which is the same path a machine
+# without gh takes.
+#
 refresh_pr_cache() {
     : > "$PR_CACHE"
 
-    if [[ "$GH_AVAILABLE" != true || -z "$REPO_SLUG" ]]; then
+    if [[ "$GH_AVAILABLE" != true || -z "$REPO_OWNER" || -z "$REPO_NAME" ]]; then
         return
     fi
 
-    #
-    # Fetch all PRs once and cache the newest PR per head branch.
-    #
-    # This avoids one GitHub request per branch/worktree and therefore scales
-    # much better for repositories with many local branches.
-    #
-    # GitHub returns 100 PRs per page. gh --paginate follows all pages.
-    #
+    collect_pr_heads
 
-    gum spin \
-        --spinner dot \
-        --title "Loading GitHub pull request metadata..." \
-        -- \
-        bash -c "
-            gh api --paginate \
-                'repos/$REPO_SLUG/pulls?state=all&sort=created&direction=desc&per_page=100' \
-                --jq '.[] |
-                    [
-                        .head.ref,
-                        (if .merged_at != null then \"merged\" else .state end),
-                        (.number | tostring),
-                        .html_url
-                    ] |
-                    @tsv' \
-            | awk -f '$PR_DEDUPE_AWK' \
-            > '$PR_CACHE'
-        "
+    local total
+    total=$(count_rows "$PR_HEADS")
 
-    local count
-    count=$(wc -l < "$PR_CACHE" | tr -d ' ')
+    if [[ "$total" -eq 0 ]]; then
+        return
+    fi
 
-    info "Cached GitHub metadata for $count branch heads."
+    local first=1
+    local last
+    local failed=0
+
+    while [[ "$first" -le "$total" ]]; do
+        last=$((first + PR_QUERY_BATCH_SIZE - 1))
+        [[ "$last" -gt "$total" ]] && last="$total"
+
+        #
+        # Printed rather than spun, because a spinner has to wrap the work to
+        # mean anything and gum spin cannot call a shell function. A batch is
+        # one request, so the line moves at the speed of the work behind it.
+        #
+        if [[ "$total" -gt "$PR_QUERY_BATCH_SIZE" ]]; then
+            printf '\r  Reading pull request state: %s-%s of %s' \
+                "$first" "$last" "$total"
+        fi
+
+        query_pr_batch "$first" "$last" || failed=$((failed + 1))
+
+        first=$((last + 1))
+    done
+
+    [[ "$total" -gt "$PR_QUERY_BATCH_SIZE" ]] && printf '\r%*s\r' 60 ""
+
+    if [[ "$failed" -gt 0 ]]; then
+        warning "$failed pull request request(s) failed; classification falls back to git."
+    fi
+
+    info "Read pull request state for $(count_rows "$PR_CACHE") of $total local branches."
 }
 
 pr_info_for_branch() {
@@ -543,11 +803,25 @@ pr_info_for_branch() {
 # Worktree scanning
 # -----------------------------------------------------------------------------
 
+#
+# Re-reads the porcelain worktree list into a file the lookups below share.
+#
+# Every one of those lookups used to run `git worktree list` itself, and they run
+# per branch and per worktree: a repository with 70 branches and 36 worktrees
+# asked git the same question over a hundred times per scan. Reading it once and
+# querying the file costs one git process instead.
+#
+# It is re-read rather than cached for the run, because a worktree can appear or
+# be removed between a scan and an action, and the actions call this first.
+#
+refresh_worktree_list() {
+    git worktree list --porcelain > "$WORKTREE_LIST" 2>/dev/null || : > "$WORKTREE_LIST"
+}
+
 worktree_is_locked() {
     local target="$1"
 
-    git worktree list --porcelain |
-        awk -v target="$target" '
+    awk -v target="$target" '
             /^worktree / {
                 current = substr($0, 10)
             }
@@ -559,7 +833,7 @@ worktree_is_locked() {
             END {
                 exit !found
             }
-        '
+        ' "$WORKTREE_LIST"
 }
 
 worktree_is_dirty() {
@@ -572,115 +846,259 @@ worktree_is_dirty() {
     )" ]]
 }
 
-branch_upstream_track() {
-    local branch="$1"
+#
+# How many worktrees are inspected at once.
+#
+# `git status` is by far the most expensive thing this tool does — in a
+# repository with 36 worktrees it was 15 of the scan's 19 seconds — and it is
+# dominated by waiting on the filesystem, not by CPU. Running a handful at a time
+# turns that wait into overlap. The cap keeps a large worktree set from starting
+# 36 full status walks against one disk at once.
+#
+default_probe_limit() {
+    local cpus
 
+    cpus="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+
+    [[ "$cpus" =~ ^[0-9]+$ ]] || cpus=4
+    [[ "$cpus" -gt 6 ]] && cpus=6
+    [[ "$cpus" -lt 1 ]] && cpus=1
+
+    echo "$cpus"
+}
+
+#
+# Reads committer date, upstream and tracking state for every local branch in one
+# call.
+#
+# Worktrees share the repository's refs, so this is the same answer that running
+# `git log -1` and `git for-each-ref` inside each worktree produced, at one git
+# process instead of three per worktree. Measured on the repository that prompted
+# this: 4.5 seconds down to 0.04.
+#
+write_ref_metadata() {
     git for-each-ref \
-        --format='%(upstream:track)' \
-        "refs/heads/$branch"
+        --format='%(refname:short)%09%(committerdate:short)%09%(committerdate:unix)%09%(upstream:short)%09%(upstream:track)' \
+        refs/heads > "$REF_DATA"
+}
+
+ref_metadata_field() {
+    local branch="$1"
+    local column="$2"
+
+    awk -F '\t' -v branch="$branch" -v column="$column" '
+        $1 == branch {
+            print $column
+            exit
+        }
+    ' "$REF_DATA"
+}
+
+#
+# Answers "is this worktree dirty?" for every worktree, a few at a time.
+#
+# Each probe writes its own file rather than appending to a shared one, so no
+# result can be interleaved with another.
+#
+probe_dirty_states() {
+    local paths="$1"
+    local out="$2"
+
+    local limit
+    local running=0
+    local index=0
+    local total
+    local path
+
+    limit="$(default_probe_limit)"
+    total=$(count_rows "$paths")
+
+    rm -f "$TMP_ROOT"/dirty-probe.* 2>/dev/null || true
+    : > "$out"
+
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+
+        index=$((index + 1))
+
+        probe_one_dirty_state "$path" "$TMP_ROOT/dirty-probe.$index" &
+
+        running=$((running + 1))
+
+        if [[ "$running" -ge "$limit" ]]; then
+            wait
+            running=0
+            show_scan_progress "Reading worktrees" "$index" "$total"
+        fi
+    done < "$paths"
+
+    wait
+
+    show_scan_progress "Reading worktrees" "$total" "$total"
+
+    cat "$TMP_ROOT"/dirty-probe.* > "$out" 2>/dev/null || : > "$out"
+    rm -f "$TMP_ROOT"/dirty-probe.* 2>/dev/null || true
+}
+
+probe_one_dirty_state() {
+    local path="$1"
+    local out="$2"
+
+    if [[ -n "$(
+        git -C "$path" status --porcelain --ignore-submodules=none 2>/dev/null
+    )" ]]; then
+        printf '%s\tDIRTY\n' "$path" > "$out"
+    else
+        printf '%s\tCLEAN\n' "$path" > "$out"
+    fi
+}
+
+dirty_state_of() {
+    local path="$1"
+    local states="$2"
+
+    awk -F '\t' -v path="$path" '
+        $1 == path {
+            print $2
+            exit
+        }
+    ' "$states"
+}
+
+#
+# Turns the porcelain worktree list into one record per worktree: path, branch
+# and whether git holds it locked. All three are in the list already, so no git
+# process is needed per worktree to read them.
+#
+parse_worktree_list() {
+    local out="$1"
+
+    awk -v primary="$PRIMARY_WORKTREE" '
+        function flush() {
+            if (path != "" && path != primary) {
+                printf "%s\t%s\t%s\n", path, (branch == "" ? "(detached)" : branch), locked
+            }
+
+            path = ""
+            branch = ""
+            locked = "false"
+        }
+
+        /^worktree / {
+            flush()
+            path = substr($0, 10)
+            next
+        }
+
+        /^branch refs\/heads\// {
+            # "branch refs/heads/" is 18 characters, so the name starts at 19.
+            branch = substr($0, 19)
+            next
+        }
+
+        /^locked/ {
+            locked = "true"
+            next
+        }
+
+        END {
+            flush()
+        }
+    ' "$WORKTREE_LIST" > "$out"
 }
 
 scan_worktrees() {
     : > "$WORKTREE_DATA"
 
+    refresh_worktree_list
+    write_ref_metadata
+
+    local records="$TMP_ROOT/worktree-records.tsv"
+    local paths="$TMP_ROOT/worktree-paths.txt"
+    local states="$TMP_ROOT/worktree-dirty.tsv"
+
+    parse_worktree_list "$records"
+    cut -f1 "$records" > "$paths"
+
+    probe_dirty_states "$paths" "$states"
+
     local index=0
 
-    git worktree list --porcelain |
-        awk '/^worktree / { print substr($0, 10) }' |
-        while IFS= read -r wt; do
-            [[ "$wt" == "$PRIMARY_WORKTREE" ]] && continue
-            [[ ! -d "$wt" ]] && continue
+    local path
+    local branch
+    local locked
+    local date
+    local epoch
+    local age
+    local track
+    local gone
+    local state
+    local pr_state
+    local pr_number
+    local pr_url
+    local pr_info
 
-            index=$((index + 1))
+    while IFS=$'\t' read -r path branch locked; do
+        [[ -z "$path" ]] && continue
+        [[ ! -d "$path" ]] && continue
 
-            local branch
-            local date
-            local epoch
-            local age
-            local state
-            local upstream
-            local gone
-            local locked
-            local dirty
-            local pr_state
-            local pr_number
-            local pr_url
-            local pr_info
+        index=$((index + 1))
 
-            branch="$(
-                git -C "$wt" branch --show-current 2>/dev/null || true
-            )"
+        date="unknown"
+        epoch="0"
+        gone=false
 
-            [[ -z "$branch" ]] && branch="(detached)"
+        if [[ "$branch" != "(detached)" ]]; then
+            date="$(ref_metadata_field "$branch" 2)"
+            epoch="$(ref_metadata_field "$branch" 3)"
+            track="$(ref_metadata_field "$branch" 5)"
 
-            date="$(
-                git -C "$wt" log -1 --format='%cs' 2>/dev/null ||
-                    echo "unknown"
-            )"
+            [[ -z "$date" ]] && date="unknown"
+            [[ -z "$epoch" ]] && epoch="0"
 
-            epoch="$(
-                git -C "$wt" log -1 --format='%ct' 2>/dev/null ||
-                    echo "0"
-            )"
-
-            age="$(age_in_days "$epoch")"
-
-            dirty=false
-            locked=false
-            gone=false
-
-            if worktree_is_dirty "$wt"; then
-                dirty=true
+            if [[ "$track" == *"[gone]"* ]]; then
+                gone=true
             fi
+        fi
 
-            if worktree_is_locked "$wt"; then
-                locked=true
-            fi
+        age="$(age_in_days "$epoch")"
 
-            upstream=""
+        if [[ "$locked" == "true" ]]; then
+            state="LOCKED"
+        elif [[ "$(dirty_state_of "$path" "$states")" == "DIRTY" ]]; then
+            state="DIRTY"
+        else
+            state="CLEAN"
+        fi
 
-            if [[ "$branch" != "(detached)" ]]; then
-                upstream="$(branch_upstream_track "$branch")"
+        pr_state="unknown"
+        pr_number=""
+        pr_url=""
 
-                if [[ "$upstream" == *"[gone]"* ]]; then
-                    gone=true
-                fi
-            fi
+        if [[ "$branch" != "(detached)" ]]; then
+            pr_info="$(pr_info_for_branch "$branch")"
 
-            if [[ "$locked" == true ]]; then
-                state="LOCKED"
-            elif [[ "$dirty" == true ]]; then
-                state="DIRTY"
-            else
-                state="CLEAN"
-            fi
-
-            pr_state="unknown"
-            pr_number=""
-            pr_url=""
-
-            if [[ "$branch" != "(detached)" ]]; then
-                pr_info="$(pr_info_for_branch "$branch")"
-
-                IFS=$'\t' read -r pr_state pr_number pr_url <<EOF
+            IFS=$'\t' read -r pr_state pr_number pr_url <<EOF
 $pr_info
 EOF
-            fi
+        fi
 
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-                "W$(printf '%05d' "$index")" \
-                "$wt" \
-                "$branch" \
-                "$date" \
-                "$age" \
-                "$state" \
-                "$gone" \
-                "$pr_state" \
-                "$pr_number" \
-                "$pr_url" \
-                "$epoch" \
-                >> "$WORKTREE_DATA"
-        done
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "W$(printf '%05d' "$index")" \
+            "$path" \
+            "$branch" \
+            "$date" \
+            "$age" \
+            "$state" \
+            "$gone" \
+            "$pr_state" \
+            "$pr_number" \
+            "$pr_url" \
+            "$epoch" \
+            >> "$WORKTREE_DATA"
+    done < "$records"
+
+    clear_scan_progress
 }
 
 # -----------------------------------------------------------------------------
@@ -701,8 +1119,7 @@ branch_is_checked_out() {
 branch_worktree_path() {
     local branch="$1"
 
-    git worktree list --porcelain |
-        awk -v ref="refs/heads/$branch" '
+    awk -v ref="refs/heads/$branch" '
             /^worktree / {
                 current = substr($0, 10)
             }
@@ -711,7 +1128,7 @@ branch_worktree_path() {
                 print current
                 exit
             }
-        '
+        ' "$WORKTREE_LIST"
 }
 
 branch_field() {
@@ -768,6 +1185,9 @@ scan_branches() {
     : > "$BRANCH_DATA"
 
     local index=0
+    local total
+
+    total=$(git for-each-ref --format='%(refname:short)' refs/heads | wc -l | tr -d ' ')
 
     git for-each-ref \
         --sort=committerdate \
@@ -778,6 +1198,8 @@ scan_branches() {
 
             index=$((index + 1))
 
+            show_scan_progress "Classifying branches" "$index" "$total"
+
             local age
             local gone=false
             local checked_out=false
@@ -787,6 +1209,7 @@ scan_branches() {
             local pr_number
             local pr_url
             local pr_info
+            local protected
 
             age="$(age_in_days "$epoch")"
 
@@ -818,7 +1241,13 @@ scan_branches() {
 $pr_info
 EOF
 
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            protected=false
+
+            if branch_is_protected "$branch"; then
+                protected=true
+            fi
+
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "B$(printf '%05d' "$index")" \
                 "$branch" \
                 "$date" \
@@ -832,21 +1261,63 @@ EOF
                 "$pr_url" \
                 "$epoch" \
                 "$squash_merged" \
+                "$protected" \
                 >> "$BRANCH_DATA"
         done
+
+    clear_scan_progress
 }
 
+#
+# Scanning is the slow part and it has to look like it.
+#
+# The spinner this replaces ran a `bash -c "exit 0"` next to the scan rather than
+# around it: it appeared and vanished, and then the assistant sat silent for the
+# fifteen seconds the scan actually took. gum spin cannot wrap a shell function,
+# so the scanners report their own progress instead, which also makes the two
+# genuinely slow steps visible as what they are — a status call per worktree and
+# a patch comparison per unmerged branch.
+#
 refresh_repository_state() {
-    gum spin \
-        --spinner dot \
-        --title "Scanning repository..." \
-        -- \
-        bash -c "
-            exit 0
-        "
+    NOW_EPOCH="$(date +%s)"
 
     scan_worktrees
     scan_branches
+
+    STATE_IS_STALE=false
+}
+
+#
+# Records that the repository changed under the current scan, so the next menu
+# pass re-reads it. Every deletion path calls this.
+#
+mark_state_stale() {
+    STATE_IS_STALE=true
+}
+
+#
+# Menus used to rescan on every pass through their loop, which meant paying the
+# full scan again after cancelling a filter or backing out of a submenu. The
+# scan is only repeated when something actually changed.
+#
+refresh_repository_state_if_stale() {
+    [[ "${STATE_IS_STALE:-true}" == true ]] || return 0
+
+    refresh_repository_state
+}
+
+show_scan_progress() {
+    local label="$1"
+    local done_count="$2"
+    local total="$3"
+
+    [[ "$total" -gt 0 ]] || return 0
+
+    printf '\r  %s %s/%s' "$label" "$done_count" "$total"
+}
+
+clear_scan_progress() {
+    printf '\r%*s\r' 60 ""
 }
 
 # -----------------------------------------------------------------------------
@@ -870,23 +1341,79 @@ count_worktree_state() {
         "$WORKTREE_DATA"
 }
 
-count_worktree_merged() {
-    awk -F '\t' '$8 == "merged" { count++ } END { print count+0 }' \
-        "$WORKTREE_DATA"
+#
+# Counts by the evidence ladder, not by one rung of it.
+#
+# The dashboard used to report "Merged PR", which is the only rung a forge can
+# see. A repository full of squash merges therefore showed a small number right
+# above a plan that then classified three times as many as merged, and the two
+# screens contradicted each other on the one question the user is here to answer.
+# Both now count the same way.
+#
+count_worktree_class() {
+    local wanted="$1"
+
+    awk -F '\t' -v wanted="$wanted" '
+        FILENAME == branches {
+            if ($8 == "true" || $13 == "true") {
+                merged_branch[$2] = 1
+            }
+
+            if ($14 == "true") {
+                protected_branch[$2] = 1
+            }
+
+            next
+        }
+
+        {
+            if (protected_branch[$3] == 1)
+                class = "PROTECTED"
+            else if ($8 == "merged" || merged_branch[$3] == 1)
+                class = "MERGED"
+            else if ($7 == "true" && $8 != "open")
+                class = "ABANDONED"
+            else
+                class = "UNCLEAR"
+
+            if (class == wanted) {
+                count++
+            }
+        }
+
+        END {
+            print count+0
+        }
+    ' branches="$BRANCH_DATA" "$BRANCH_DATA" "$WORKTREE_DATA"
 }
 
-count_worktree_gone() {
-    awk -F '\t' '$7 == "true" { count++ } END { print count+0 }' \
-        "$WORKTREE_DATA"
+count_branch_class() {
+    local wanted="$1"
+
+    awk -F '\t' -v wanted="$wanted" '
+        {
+            if ($14 == "true")
+                class = "PROTECTED"
+            else if ($8 == "true" || $13 == "true" || $9 == "merged")
+                class = "MERGED"
+            else if ($6 == "true" && $9 != "open")
+                class = "ABANDONED"
+            else
+                class = "UNCLEAR"
+
+            if (class == wanted) {
+                count++
+            }
+        }
+
+        END {
+            print count+0
+        }
+    ' "$BRANCH_DATA"
 }
 
 count_branch_gone() {
     awk -F '\t' '$6 == "true" { count++ } END { print count+0 }' \
-        "$BRANCH_DATA"
-}
-
-count_branch_merged_pr() {
-    awk -F '\t' '$9 == "merged" { count++ } END { print count+0 }' \
         "$BRANCH_DATA"
 }
 
@@ -910,30 +1437,47 @@ show_dashboard() {
     echo "Repository:      $REPO_ROOT"
     echo "Primary branch:  $PRIMARY_BRANCH"
     echo "Base ref:        $BASE_REF"
-    echo "Stale threshold: ${STALE_DAYS} days"
     echo
 
     if [[ "$GH_AVAILABLE" == true ]]; then
         echo "GitHub:          ${GREEN}enabled${RESET}"
     else
-        echo "GitHub:          ${YELLOW}unavailable${RESET}"
+        echo "GitHub:          ${YELLOW}unavailable${RESET} (git evidence only)"
     fi
 
     echo
-    echo "${BOLD}Worktrees${RESET}"
-    printf "  %-18s %s\n" "Total:" "$(count_rows "$WORKTREE_DATA")"
-    printf "  %-18s %s\n" "Clean:" "$(count_worktree_state CLEAN)"
-    printf "  %-18s %s\n" "Dirty:" "$(count_worktree_state DIRTY)"
-    printf "  %-18s %s\n" "Locked:" "$(count_worktree_state LOCKED)"
-    printf "  %-18s %s\n" "Merged PR:" "$(count_worktree_merged)"
-    printf "  %-18s %s\n" "Gone upstream:" "$(count_worktree_gone)"
+    printf "%-18s %8s  %8s\n" "" "WORKTREES" "BRANCHES"
+    printf "%-18s %8s  %8s\n" \
+        "Total" \
+        "$(count_rows "$WORKTREE_DATA")" \
+        "$(count_rows "$BRANCH_DATA")"
+    printf "%-18s %8s  %8s\n" \
+        "Merged" \
+        "$(count_worktree_class MERGED)" \
+        "$(count_branch_class MERGED)"
+    printf "%-18s %8s  %8s\n" \
+        "Abandoned" \
+        "$(count_worktree_class ABANDONED)" \
+        "$(count_branch_class ABANDONED)"
+    printf "%-18s %8s  %8s\n" \
+        "Unclear" \
+        "$(count_worktree_class UNCLEAR)" \
+        "$(count_branch_class UNCLEAR)"
+
+    #
+    # Always shown, including as a zero: the four classes are exhaustive, so a
+    # reader can add them up and get the total. Hiding one when it is empty makes
+    # the arithmetic fail exactly when a protected branch appears.
+    #
+    printf "%-18s %8s  %8s\n" \
+        "Protected" \
+        "$(count_worktree_class PROTECTED)" \
+        "$(count_branch_class PROTECTED)"
 
     echo
-    echo "${BOLD}Local branches${RESET}"
-    printf "  %-18s %s\n" "Total:" "$(count_rows "$BRANCH_DATA")"
-    printf "  %-18s %s\n" "Merged PR:" "$(count_branch_merged_pr)"
-    printf "  %-18s %s\n" "Gone upstream:" "$(count_branch_gone)"
-    printf "  %-18s %s\n" "Older than ${STALE_DAYS}d:" "$(count_branch_old)"
+    printf "%-18s %8s\n" "Dirty worktrees" "$(count_worktree_state DIRTY)"
+    printf "%-18s %8s\n" "Locked worktrees" "$(count_worktree_state LOCKED)"
+    printf "%-18s %8s\n" "Older than ${STALE_DAYS}d" "$(count_branch_old)"
 
     echo
 }
@@ -942,12 +1486,123 @@ show_dashboard() {
 # Worktree display
 # -----------------------------------------------------------------------------
 
-worktree_display_rows() {
-    local mode="$1"
+#
+# Looks a branch up in the branch scan by name rather than by id, which is how a
+# worktree reaches the merge evidence gathered for the branch it has checked out.
+#
+branch_data_field_by_name() {
+    local branch="$1"
+    local column="$2"
 
-    awk -F '\t' -v mode="$mode" -v stale="$STALE_DAYS" '
-        function yn(v, yes, no) {
-            return v == "true" ? yes : no
+    awk -F '\t' -v branch="$branch" -v column="$column" '
+        $2 == branch {
+            print $column
+            exit
+        }
+    ' "$BRANCH_DATA"
+}
+
+#
+# The same evidence ladder the branches use, applied to the worktree that holds
+# one.
+#
+# It used to be a different question here: worktrees were sorted into "safe",
+# "candidates" and "dirty" while branches were sorted into merged, abandoned and
+# unclear, so the same finished work was described two ways in two menus and
+# neither list said what the other would do about it. A worktree is a checkout of
+# a branch, and the reason to remove it is the reason that branch is finished.
+#
+#   PROVEN     the branch is on the base ref: by ancestry, by patch after a
+#              squash merge, or by a merged pull request
+#   ABANDONED  the remote branch was deleted and no pull request is open
+#   UNKNOWN    no signal either way
+#
+# The state is carried as a suffix, because it decides how the removal is
+# confirmed rather than whether the worktree is a candidate: ":DIRTY" and
+# ":LOCKED" are never removed in bulk, whatever the evidence says.
+#
+classify_worktree() {
+    local id="$1"
+
+    local branch
+    local state
+    local gone
+    local pr
+    local git_merged
+    local squash_merged
+    local class
+
+    branch="$(worktree_field "$id" 3)"
+    state="$(worktree_field "$id" 6)"
+    gone="$(worktree_field "$id" 7)"
+    pr="$(worktree_field "$id" 8)"
+
+    if branch_is_protected "$branch"; then
+        echo "PROTECTED"
+        return
+    fi
+
+    git_merged="$(branch_data_field_by_name "$branch" 8)"
+    squash_merged="$(branch_data_field_by_name "$branch" 13)"
+
+    if [[ "$pr" == "merged" ||
+        "$git_merged" == "true" ||
+        "$squash_merged" == "true" ]]
+    then
+        class="PROVEN"
+    elif [[ "$gone" == "true" && "$pr" != "open" ]]; then
+        class="ABANDONED"
+    else
+        class="UNKNOWN"
+    fi
+
+    [[ "$state" != "CLEAN" ]] && class="$class:$state"
+
+    echo "$class"
+}
+
+worktree_field() {
+    local id="$1"
+    local column="$2"
+
+    awk -F '\t' -v id="$id" -v column="$column" '
+        $1 == id {
+            print $column
+            exit
+        }
+    ' "$WORKTREE_DATA"
+}
+
+#
+# One list, in the same shape the branch list has: the class first, then what
+# decides how a removal is confirmed, then age, branch and path. Typing MERGED,
+# ABANDONED, UNCLEAR, DIRTY or LOCKED narrows it, which is what the four
+# overlapping modes were trying to be.
+#
+#
+# One list, in the same shape the branch list has: the class first, then what
+# decides how a removal is confirmed, then age, branch and path. Typing MERGED,
+# ABANDONED, UNCLEAR, DIRTY or LOCKED narrows it, which is what the four
+# overlapping modes were trying to be.
+#
+worktree_display_rows() {
+    #
+    # Reads the branch scan first, so the merge evidence gathered per branch —
+    # ancestry and patch equivalence, not just the pull request — decides the
+    # label here too. A worktree and the branch it holds can no longer be
+    # described differently in two lists.
+    #
+    awk -F '\t' '
+        FILENAME == branches {
+            if ($8 == "true" || $13 == "true") {
+                merged_branch[$2] = 1
+            }
+
+            if ($14 == "true") {
+                protected_branch[$2] = 1
+            }
+
+            next
         }
 
         {
@@ -959,65 +1614,99 @@ worktree_display_rows() {
             gone=$7
             pr=$8
 
-            candidate = (pr == "merged" ||
-                gone == "true" ||
-                (age != "?" && age >= stale))
+            if (protected_branch[branch] == 1)
+                class = "PROTECTED"
+            else if (pr == "merged" || merged_branch[branch] == 1)
+                class = "MERGED"
+            else if (gone == "true" && pr != "open")
+                class = "ABANDONED"
+            else
+                class = "UNCLEAR"
 
-            safe = (state == "CLEAN")
-
-            include = 0
-
-            if (mode == "all") {
-                include = 1
-            }
-            else if (mode == "candidates" && candidate) {
-                include = 1
-            }
-            else if (mode == "safe" && candidate && safe) {
-                include = 1
-            }
-            else if (mode == "dirty" && state != "CLEAN") {
-                include = 1
-            }
-
-            if (!include) {
-                next
-            }
-
-            printf "%s | %-6s | %-6s | %-4s | %4sd | %s | %s\n",
+            printf "%s | %-9s | %-6s | %4sd | %s | %s\n",
                 id,
-                state,
-                (pr == "merged" ? "MERGED" : "-"),
-                (gone == "true" ? "GONE" : "-"),
+                class,
+                (state == "CLEAN" ? "-" : state),
                 age,
                 branch,
                 path
         }
-    ' "$WORKTREE_DATA"
+    ' branches="$BRANCH_DATA" "$BRANCH_DATA" "$WORKTREE_DATA"
 }
 
+#
+# Candidates start selected.
+#
+# Picking twenty worktrees out of a filter one Tab at a time is the step that
+# stops a cleanup from happening at all, and the tool already knows which ones it
+# would suggest. Deselecting the two you want to keep is the shorter path to the
+# same answer, and nothing is removed before the plan has been shown anyway.
+#
 select_worktrees() {
-    local mode="$1"
     local rows
+    local preselected
 
-    rows="$(worktree_display_rows "$mode")"
+    rows="$(worktree_display_rows)"
 
     if [[ -z "$rows" ]]; then
-        warning "No matching worktrees."
-        gum input --placeholder "Press Enter to continue" >/dev/null
+        warning "No worktrees besides the primary one."
+        pause
         return 1
     fi
+
+    preselected="$(
+        printf '%s\n' "$rows" |
+            awk -F ' \\| ' '
+                $2 ~ /^ *(MERGED|ABANDONED) *$/ && $3 ~ /^ *- *$/ {
+                    print $0
+                }
+            ' |
+            paste -sd, -
+    )"
 
     printf '%s\n' "$rows" |
         gum filter \
             --no-limit \
             --height "$LIST_HEIGHT" \
-            --header "Tab / Ctrl+Space selects. Enter confirms. Type to filter." \
+            --selected "$preselected" \
+            --header "Merged and abandoned clean worktrees start selected. Tab toggles, Enter confirms. Type MERGED, ABANDONED, UNCLEAR, DIRTY or LOCKED to narrow." \
             --placeholder "Filter worktrees..."
 }
 
 selected_ids() {
     sed -E 's/^([^ ]+).*/\1/'
+}
+
+#
+# Reads a newline separated list of ids into SELECTED_IDS, so callers can walk a
+# selection with a for loop.
+#
+# This exists because `while read ... done < list` is the wrong shape for a loop
+# whose body asks a question. The loop owns stdin for as long as it runs, so the
+# first gum prompt inside it reads the remaining ids as keystrokes, answers
+# itself with them and returns instantly for everything after the first entry.
+# Selecting twenty branches and watching one of them disappear was that bug, not
+# a deletion that was refused. An array holds the list without holding stdin.
+#
+load_ids() {
+    local raw="$1"
+    local line
+
+    SELECTED_IDS=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        SELECTED_IDS[${#SELECTED_IDS[@]}]="$line"
+    done <<< "$raw"
+}
+
+#
+# `set -u` treats an empty array as unset in Bash 3.2, which is the version
+# macOS ships, so every expansion of a possibly empty selection goes through
+# this instead of "${SELECTED_IDS[@]}".
+#
+selected_count() {
+    echo "${#SELECTED_IDS[@]}"
 }
 
 show_worktree_details() {
@@ -1026,9 +1715,11 @@ show_worktree_details() {
 
     : > "$detail_file"
 
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
+    local id
 
+    load_ids "$ids"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
         awk -F '\t' -v id="$id" '
             $1 == id {
                 print "────────────────────────────────────────────────────────────"
@@ -1070,51 +1761,194 @@ show_worktree_details() {
 
             echo >> "$detail_file"
         fi
-
-    done <<< "$ids"
+    done
 
     gum pager < "$detail_file"
 }
 
-remove_selected_clean_worktrees() {
+#
+# One action for a whole worktree selection, with the same shape as the branch
+# plan: sort by evidence, show what will happen, ask once for everything the
+# ladder cleared, and hold back what needs a decision.
+#
+# The old flow asked which of four overlapping modes to enter, then which of
+# three actions to run inside it, and quietly dropped whatever the chosen action
+# did not cover. Nothing in that sequence was a question the user had the
+# information to answer.
+#
+plan_worktree_removals() {
     local ids="$1"
+
+    local proven="$TMP_ROOT/wt-plan-proven.txt"
+    local abandoned="$TMP_ROOT/wt-plan-abandoned.txt"
+    local unknown="$TMP_ROOT/wt-plan-unknown.txt"
+    local held="$TMP_ROOT/wt-plan-held.txt"
+    local kept="$TMP_ROOT/wt-plan-kept.txt"
+
+    : > "$proven"
+    : > "$abandoned"
+    : > "$unknown"
+    : > "$held"
+    : > "$kept"
+
+    local id
+    local class
+
+    load_ids "$ids"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+        class="$(classify_worktree "$id")"
+
+        #
+        # A dirty or locked worktree is never removed in bulk, whatever the
+        # evidence says: the evidence is about the branch, and what is at stake
+        # here is uncommitted work.
+        #
+        case "$class" in
+            PROTECTED*)       echo "$id" >> "$kept" ;;
+            *:DIRTY|*:LOCKED) echo "$id" >> "$held" ;;
+            PROVEN)           echo "$id" >> "$proven" ;;
+            ABANDONED)        echo "$id" >> "$abandoned" ;;
+            *)                echo "$id" >> "$unknown" ;;
+        esac
+    done
+
+    local proven_count
+    local abandoned_count
+    local unknown_count
+    local held_count
+    local kept_count
+
+    proven_count=$(count_rows "$proven")
+    abandoned_count=$(count_rows "$abandoned")
+    unknown_count=$(count_rows "$unknown")
+    held_count=$(count_rows "$held")
+    kept_count=$(count_rows "$kept")
+
+    local clearing=$((proven_count + abandoned_count))
+
+    clear
+    title "Worktree Removal Plan"
+
+    if [[ "$proven_count" -gt 0 ]]; then
+        echo "  ${GREEN}$proven_count${RESET} merged"
+        echo "      the branch is already on $BASE_REF"
+        echo
+    fi
+
+    if [[ "$abandoned_count" -gt 0 ]]; then
+        echo "  ${GREEN}$abandoned_count${RESET} abandoned"
+        echo "      the remote branch was deleted and no pull request is open"
+        echo
+    fi
+
+    if [[ "$unknown_count" -gt 0 ]]; then
+        echo "  ${YELLOW}$unknown_count${RESET} unclear"
+        echo "      no signal either way; confirmed separately"
+        echo
+    fi
+
+    if [[ "$held_count" -gt 0 ]]; then
+        echo "  ${CYAN}$held_count${RESET} dirty or locked"
+        echo "      never removed in bulk; reviewed one at a time"
+        echo
+    fi
+
+    if [[ "$kept_count" -gt 0 ]]; then
+        echo "  ${CYAN}$kept_count${RESET} kept"
+        echo "      a protected branch is checked out there"
+        echo
+    fi
+
+    if [[ "$clearing" -eq 0 && "$unknown_count" -eq 0 && "$held_count" -eq 0 ]]; then
+        warning "Nothing in this selection can be removed."
+        pause
+        return
+    fi
+
+    if [[ "$clearing" -gt 0 ]]; then
+        echo "Removing a worktree deletes its directory. These have no"
+        echo "uncommitted changes, and the branch stays where it is."
+        echo
+
+        if confirm "Remove these $clearing worktrees?"; then
+            echo
+            remove_worktrees_from_list "$proven"
+            remove_worktrees_from_list "$abandoned"
+        else
+            info "Kept all $clearing."
+        fi
+    fi
+
+    if [[ "$unknown_count" -gt 0 ]]; then
+        echo
+        warning "$unknown_count worktree(s) carry no evidence that their work landed."
+        echo "They are clean, so nothing uncommitted is lost, but the branch may"
+        echo "still be unfinished."
+        echo
+
+        if confirm "Remove these $unknown_count as well?"; then
+            remove_worktrees_from_list "$unknown"
+        else
+            info "Kept all $unknown_count."
+        fi
+    fi
+
+    if [[ "$held_count" -gt 0 ]]; then
+        local held_id
+
+        load_ids "$(cat "$held")"
+
+        for held_id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+            review_dirty_worktree "$held_id"
+        done
+    fi
+
+    echo
+    pause
+}
+
+#
+# Removes a list of worktrees the plan has already authorised. The state is
+# re-read per worktree rather than trusted from the scan, because this is the
+# point where a wrong answer costs uncommitted work.
+#
+remove_worktrees_from_list() {
+    local list="$1"
     local count=0
 
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
+    local id
+    local path
+    local branch
 
-        local path
-        local branch
-        local state
+    load_ids "$(cat "$list")"
 
-        path="$(
-            awk -F '\t' -v id="$id" '$1 == id { print $2 }' "$WORKTREE_DATA"
-        )"
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+        path="$(worktree_field "$id" 2)"
+        branch="$(worktree_field "$id" 3)"
 
-        branch="$(
-            awk -F '\t' -v id="$id" '$1 == id { print $3 }' "$WORKTREE_DATA"
-        )"
+        refresh_worktree_list
 
-        state="$(
-            awk -F '\t' -v id="$id" '$1 == id { print $6 }' "$WORKTREE_DATA"
-        )"
-
-        if [[ "$state" != "CLEAN" ]]; then
-            warning "Skipping $branch: worktree is $state."
+        if [[ "$(worktree_state "$path")" != "CLEAN" ]]; then
+            warning "Skipping $branch: the worktree changed since the scan."
             continue
         fi
 
         if git worktree remove --force "$path"; then
             success "Removed worktree: $branch"
             count=$((count + 1))
+            mark_state_stale
         else
             warning "Could not remove: $branch"
         fi
-    done <<< "$ids"
+    done
 
     git worktree prune
+    refresh_worktree_list
 
-    info "Removed $count worktree(s)."
+    [[ "$count" -gt 0 ]] && info "Removed $count worktree(s)."
+
+    return 0
 }
 
 review_dirty_worktree() {
@@ -1164,10 +1998,7 @@ review_dirty_worktree() {
             if confirm "Really delete worktree '$branch'?"; then
                 local typed
 
-                typed="$(
-                    gum input \
-                        --placeholder "Type DELETE to confirm"
-                )"
+                typed="$(prompt_for_line "Type DELETE to confirm: ")"
 
                 if [[ "$typed" == "DELETE" ]]; then
                     if [[ "$state" == "LOCKED" ]]; then
@@ -1176,6 +2007,8 @@ review_dirty_worktree() {
 
                     git worktree remove --force "$path"
                     git worktree prune
+                    refresh_worktree_list
+                    mark_state_stale
                 else
                     info "Confirmation did not match."
                 fi
@@ -1184,132 +2017,46 @@ review_dirty_worktree() {
     esac
 }
 
+#
+# One list, one action, matching the branch menu.
+#
+# What stood here asked for a cleanup mode before showing anything — "safe
+# candidates", "all candidates", "dirty / locked", "browse all" — and the buckets
+# overlapped, so there was no right answer to give. The list carries the class
+# and the state, gum filters on both as you type, and the plan decides what
+# happens per worktree.
+#
 worktree_menu() {
     while true; do
-        refresh_repository_state
+        refresh_repository_state_if_stale
 
         clear
         title "Worktree Cleanup"
 
-        local action
-        action="$(
+        local selected
+        local ids
+
+        selected="$(select_worktrees)" || return
+        [[ -z "$selected" ]] && return
+
+        ids="$(printf '%s\n' "$selected" | selected_ids)"
+
+        local next
+        next="$(
             menu \
-                "Choose a worktree cleanup mode" \
-                "Safe cleanup candidates" \
-                "All cleanup candidates" \
-                "Dirty / locked worktrees" \
-                "Browse all worktrees" \
-                "Back"
+                "$(printf '%s\n' "$ids" | wc -l | tr -d ' ') worktree(s) selected" \
+                "Remove selected" \
+                "Inspect selection" \
+                "Back to the list"
         )"
 
-        case "$action" in
-            "Safe cleanup candidates")
-                local selected
-                local ids
-
-                selected="$(select_worktrees safe)" || continue
-                [[ -z "$selected" ]] && continue
-
-                ids="$(printf '%s\n' "$selected" | selected_ids)"
-
-                local next
-                next="$(
-                    menu \
-                        "Selected worktrees" \
-                        "Remove selected CLEAN worktrees" \
-                        "Inspect selection" \
-                        "Cancel"
-                )"
-
-                case "$next" in
-                    "Remove selected CLEAN worktrees")
-                        show_worktree_details "$ids"
-
-                        if confirm "Remove the selected clean worktrees?"; then
-                            remove_selected_clean_worktrees "$ids"
-                        fi
-                        ;;
-
-                    "Inspect selection")
-                        show_worktree_details "$ids"
-                        ;;
-                esac
+        case "$next" in
+            "Remove selected")
+                plan_worktree_removals "$ids"
                 ;;
 
-            "All cleanup candidates")
-                local selected
-                local ids
-
-                selected="$(select_worktrees candidates)" || continue
-                [[ -z "$selected" ]] && continue
-
-                ids="$(printf '%s\n' "$selected" | selected_ids)"
-
+            "Inspect selection")
                 show_worktree_details "$ids"
-
-                local next
-                next="$(
-                    menu \
-                        "What should happen?" \
-                        "Remove CLEAN worktrees from selection" \
-                        "Review dirty / locked items individually" \
-                        "Cancel"
-                )"
-
-                case "$next" in
-                    "Remove CLEAN worktrees from selection")
-                        if confirm "Remove all CLEAN worktrees in this selection?"; then
-                            remove_selected_clean_worktrees "$ids"
-                        fi
-                        ;;
-
-                    "Review dirty / locked items individually")
-                        while IFS= read -r id; do
-                            [[ -z "$id" ]] && continue
-
-                            local state
-                            state="$(
-                                awk -F '\t' -v id="$id" \
-                                    '$1 == id { print $6 }' \
-                                    "$WORKTREE_DATA"
-                            )"
-
-                            if [[ "$state" != "CLEAN" ]]; then
-                                review_dirty_worktree "$id"
-                            fi
-                        done <<< "$ids"
-                        ;;
-                esac
-                ;;
-
-            "Dirty / locked worktrees")
-                local selected
-                local ids
-
-                selected="$(select_worktrees dirty)" || continue
-                [[ -z "$selected" ]] && continue
-
-                ids="$(printf '%s\n' "$selected" | selected_ids)"
-
-                while IFS= read -r id; do
-                    [[ -z "$id" ]] && continue
-                    review_dirty_worktree "$id"
-                done <<< "$ids"
-                ;;
-
-            "Browse all worktrees")
-                local selected
-                local ids
-
-                selected="$(select_worktrees all)" || continue
-                [[ -z "$selected" ]] && continue
-
-                ids="$(printf '%s\n' "$selected" | selected_ids)"
-                show_worktree_details "$ids"
-                ;;
-
-            *)
-                return
                 ;;
         esac
     done
@@ -1320,9 +2067,7 @@ worktree_menu() {
 # -----------------------------------------------------------------------------
 
 branch_display_rows() {
-    local mode="$1"
-
-    awk -F '\t' -v mode="$mode" '
+    awk -F '\t' '
         {
             id=$1
             branch=$2
@@ -1332,26 +2077,21 @@ branch_display_rows() {
             gitmerged=$8
             pr=$9
             squashed=$13
+            protected=$14
 
             #
             # The same ladder classify_branch walks, minus the worktree rungs it
             # cannot see from here. Both read the same fields, so a label in this
             # list and the group in the plan can never disagree.
             #
-            if (gitmerged == "true" || squashed == "true" || pr == "merged")
+            if (protected == "true")
+                class = "PROTECTED"
+            else if (gitmerged == "true" || squashed == "true" || pr == "merged")
                 class = "MERGED"
             else if (gone == "true" && pr != "open")
                 class = "ABANDONED"
             else
                 class = "UNCLEAR"
-
-            #
-            # A branch a worktree has checked out is a candidate like any other
-            # now that deleting it clears the worktree first.
-            #
-            if (mode != "all" && !(mode == "merged" && pr == "merged")) {
-                next
-            }
 
             printf "%s | %-9s | %-7s | %4sd | %s\n",
                 id,
@@ -1363,23 +2103,35 @@ branch_display_rows() {
     ' "$BRANCH_DATA"
 }
 
+#
+# Candidates start selected, for the reason the worktree list does: the tool
+# already knows what it would suggest, and Tab-selecting twenty branches out of a
+# filter is the step that stops a cleanup from happening.
+#
 select_branches() {
-    local mode="$1"
     local rows
+    local preselected
 
-    rows="$(branch_display_rows "$mode")"
+    rows="$(branch_display_rows)"
 
     if [[ -z "$rows" ]]; then
-        warning "No matching branches."
-        gum input --placeholder "Press Enter to continue" >/dev/null
+        warning "No local branches besides ${PRIMARY_BRANCH:-the primary branch}."
+        pause
         return 1
     fi
+
+    preselected="$(
+        printf '%s\n' "$rows" |
+            awk -F ' \\| ' '$2 ~ /^ *(MERGED|ABANDONED) *$/' |
+            paste -sd, -
+    )"
 
     printf '%s\n' "$rows" |
         gum filter \
             --no-limit \
             --height "$LIST_HEIGHT" \
-            --header "Type MERGED, ABANDONED, UNCLEAR or IN-WT to narrow. Tab selects, Enter confirms." \
+            --selected "$preselected" \
+            --header "Merged and abandoned branches start selected. Tab toggles, Enter confirms. Type MERGED, ABANDONED, UNCLEAR or IN-WT to narrow." \
             --placeholder "Filter branches..."
 }
 
@@ -1389,11 +2141,12 @@ show_branch_details() {
 
     : > "$detail_file"
 
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
+    local id
+    local branch
 
-        local branch
+    load_ids "$ids"
 
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
         branch="$(
             awk -F '\t' -v id="$id" '$1 == id { print $2 }' "$BRANCH_DATA"
         )"
@@ -1432,8 +2185,7 @@ show_branch_details() {
             >> "$detail_file" 2>&1 || true
 
         echo >> "$detail_file"
-
-    done <<< "$ids"
+    done
 
     gum pager < "$detail_file"
 }
@@ -1478,6 +2230,13 @@ remove_blocking_worktree() {
     local state
     local output
 
+    #
+    # Re-read rather than taken from the scan: a worktree can appear, vanish or
+    # turn dirty between the scan and this prompt, and this is the point where a
+    # wrong answer costs uncommitted work.
+    #
+    refresh_worktree_list
+
     path="$(branch_worktree_path "$branch")"
 
     [[ -z "$path" ]] && return 0
@@ -1508,7 +2267,7 @@ remove_blocking_worktree() {
 
     if [[ "$state" == "DIRTY" ]]; then
         local typed
-        typed="$(gum input --placeholder "Type DELETE to discard the changes")"
+        typed="$(prompt_for_line "Type DELETE to discard the changes: ")"
 
         if [[ "$typed" != "DELETE" ]]; then
             info "Confirmation did not match; keeping '$branch'."
@@ -1527,6 +2286,8 @@ remove_blocking_worktree() {
     fi
 
     git worktree prune
+    refresh_worktree_list
+    mark_state_stale
     success "Removed worktree: $path"
 }
 
@@ -1546,10 +2307,21 @@ force_delete_branch() {
     local hash
     local output
 
+    #
+    # Checked here as well as in the plan, because this is the function that
+    # actually deletes: every path to a deletion goes through it, so a future
+    # caller cannot route around the protection by accident.
+    #
+    if branch_is_protected "$branch"; then
+        warning "Refusing to delete protected branch '$branch'."
+        return 1
+    fi
+
     hash="$(git rev-parse --short "$branch" 2>/dev/null || echo "?")"
 
     if output="$(git branch -D "$branch" 2>&1)"; then
         success "Deleted${reason:+ ($reason)}: $branch  ·  restore: git branch $branch $hash"
+        mark_state_stale
         return 0
     fi
 
@@ -1595,6 +2367,16 @@ classify_branch() {
         return
     fi
 
+    #
+    # Above every rung of evidence, because the evidence is right and the
+    # conclusion is still wrong: a release branch is merged into the base ref and
+    # then carries on being a release branch.
+    #
+    if [[ "$(branch_field "$id" 14)" == "true" ]]; then
+        echo "PROTECTED"
+        return
+    fi
+
     if [[ "$git_merged" == "true" ||
         "$squash_merged" == "true" ||
         "$pr" == "merged" ]]
@@ -1622,13 +2404,14 @@ write_evidence_table() {
             "--------" "----" "------" "--------" "------"
     } > "$report"
 
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
+    local id
+    local branch
+    local gone
+    local pr
 
-        local branch
-        local gone
-        local pr
+    load_ids "$ids"
 
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
         branch="$(branch_field "$id" 2)"
         gone="$(branch_field "$id" 6)"
         pr="$(branch_field "$id" 9)"
@@ -1640,7 +2423,7 @@ write_evidence_table() {
             "$(commits_not_on_base "$branch")" \
             "$branch" \
             >> "$report"
-    done <<< "$ids"
+    done
 }
 
 #
@@ -1668,21 +2451,24 @@ delete_selected_branches() {
 
     local blocked=0
 
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
+    local id
+    local class
 
-        local class
+    load_ids "$ids"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
         class="$(classify_branch "$id")"
 
         [[ "$class" == *:WT ]] && blocked=$((blocked + 1))
 
         case "${class%:WT}" in
             PRIMARY)   echo "$id" >> "$kept" ;;
+            PROTECTED) echo "$id" >> "$kept" ;;
             PROVEN)    echo "$id" >> "$proven" ;;
             ABANDONED) echo "$id" >> "$abandoned" ;;
             UNKNOWN)   echo "$id" >> "$unknown" ;;
         esac
-    done <<< "$ids"
+    done
 
     local proven_count
     local abandoned_count
@@ -1720,7 +2506,7 @@ delete_selected_branches() {
 
     if [[ "$kept_count" -gt 0 ]]; then
         echo "  ${CYAN}$kept_count${RESET} kept"
-        echo "      checked out in the primary worktree, which always stays"
+        echo "      protected, or checked out in the primary worktree"
         echo
     fi
 
@@ -1731,7 +2517,7 @@ delete_selected_branches() {
 
     if [[ "$clearing" -eq 0 && "$unknown_count" -eq 0 ]]; then
         warning "Nothing in this selection can be deleted."
-        gum input --placeholder "Press Enter to continue" >/dev/null
+        pause
         return
     fi
 
@@ -1759,7 +2545,7 @@ delete_selected_branches() {
     fi
 
     echo
-    gum input --placeholder "Press Enter to continue" >/dev/null
+    pause
 }
 
 #
@@ -1772,15 +2558,17 @@ run_confirmed_deletions() {
     local list="$1"
     local reason="$2"
 
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
+    local id
+    local branch
 
-        local branch
+    load_ids "$(cat "$list")"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
         branch="$(branch_field "$id" 2)"
 
         remove_blocking_worktree "$branch" || continue
         force_delete_branch "$branch" "$reason"
-    done < "$list"
+    done
 }
 
 #
@@ -1816,22 +2604,24 @@ run_forced_deletions() {
     fi
 
     local typed
-    typed="$(gum input --placeholder "Type DELETE to confirm")"
+    typed="$(prompt_for_line "Type DELETE to confirm: ")"
 
     if [[ "$typed" != "DELETE" ]]; then
         warning "Confirmation did not match; kept all $count."
         return
     fi
 
-    while IFS= read -r id; do
-        [[ -z "$id" ]] && continue
+    local id
+    local branch
 
-        local branch
+    load_ids "$(cat "$list")"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
         branch="$(branch_field "$id" 2)"
 
         remove_blocking_worktree "$branch" || continue
         force_delete_branch "$branch"
-    done < "$list"
+    done
 }
 
 review_branch_individually() {
@@ -1845,6 +2635,8 @@ review_branch_individually() {
     branch="$(branch_field "$id" 2)"
     pr="$(branch_field "$id" 9)"
     gone="$(branch_field "$id" 6)"
+
+    refresh_worktree_list
     worktree="$(branch_worktree_path "$branch")"
 
     clear
@@ -1862,7 +2654,7 @@ review_branch_individually() {
         echo
 
         if ! remove_blocking_worktree "$branch"; then
-            gum input --placeholder "Press Enter to continue" >/dev/null
+            pause
             return
         fi
     fi
@@ -1883,9 +2675,10 @@ review_branch_individually() {
 
             if output="$(git branch -d "$branch" 2>&1)"; then
                 success "Deleted branch."
+                mark_state_stale
             else
                 report_git_refusal "$branch" "$output"
-                gum input --placeholder "Press Enter to continue" >/dev/null
+                pause
             fi
             ;;
 
@@ -1901,10 +2694,7 @@ review_branch_individually() {
             if confirm "Force delete '$branch'?"; then
                 local typed
 
-                typed="$(
-                    gum input \
-                        --placeholder "Type DELETE to confirm"
-                )"
+                typed="$(prompt_for_line "Type DELETE to confirm: ")"
 
                 if [[ "$typed" == "DELETE" ]]; then
                     force_delete_branch "$branch"
@@ -1925,7 +2715,7 @@ review_branch_individually() {
 #
 branch_menu() {
     while true; do
-        refresh_repository_state
+        refresh_repository_state_if_stale
 
         clear
         title "Local Branch Cleanup"
@@ -1933,7 +2723,7 @@ branch_menu() {
         local selected
         local ids
 
-        selected="$(select_branches all)" || return
+        selected="$(select_branches)" || return
         [[ -z "$selected" ]] && return
 
         ids="$(printf '%s\n' "$selected" | selected_ids)"
@@ -1958,10 +2748,13 @@ branch_menu() {
                 ;;
 
             "Review selected individually")
-                while IFS= read -r id; do
-                    [[ -z "$id" ]] && continue
-                    review_branch_individually "$id"
-                done <<< "$ids"
+                local branch_id
+
+                load_ids "$ids"
+
+                for branch_id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+                    review_branch_individually "$branch_id"
+                done
                 ;;
         esac
     done
@@ -1980,126 +2773,44 @@ branch_menu() {
 # The manual paths stay for what this cannot answer: reviewing a single branch,
 # or going after something the ladder files under "unclear".
 #
+#
+# The whole tool in one action.
+#
+# It used to be branch-only while calling itself a repository cleanup, so a
+# worktree whose pull request was merged months ago stayed behind unless it
+# happened to block a branch deletion — and the dashboard counted 20 of those
+# right above the menu entry that would not touch them.
+#
+# Worktrees go first, because removing one is what frees the branch underneath
+# it, so the branch pass then finds nothing pinned.
+#
 clean_up_now() {
-    refresh_repository_state
+    refresh_repository_state_if_stale
 
-    local ids
-    ids="$(cut -f1 "$BRANCH_DATA")"
+    local worktree_ids
+    local branch_ids
 
-    if [[ -z "$ids" ]]; then
+    worktree_ids="$(cut -f1 "$WORKTREE_DATA")"
+    branch_ids="$(cut -f1 "$BRANCH_DATA")"
+
+    if [[ -z "$worktree_ids" && -z "$branch_ids" ]]; then
         clear
         title "Clean Up"
-        success "No local branches besides ${PRIMARY_BRANCH:-the primary branch}."
+        success "Nothing here besides ${PRIMARY_BRANCH:-the primary branch}."
         echo
-        gum input --placeholder "Press Enter to continue" >/dev/null
+        pause
         return
     fi
 
-    delete_selected_branches "$ids"
-}
+    if [[ -n "$worktree_ids" ]]; then
+        plan_worktree_removals "$worktree_ids"
+        refresh_repository_state_if_stale
+        branch_ids="$(cut -f1 "$BRANCH_DATA")"
+    fi
 
-# -----------------------------------------------------------------------------
-# Guided cleanup
-# -----------------------------------------------------------------------------
-
-guided_cleanup() {
-    while true; do
-        refresh_repository_state
-
-        local clean_candidates
-        local merged_branches
-
-        clean_candidates="$(
-            awk -F '\t' -v stale="$STALE_DAYS" '
-                $6 == "CLEAN" &&
-                ($8 == "merged" ||
-                    $7 == "true" ||
-                    ($5 != "?" && $5 >= stale)) {
-                    count++
-                }
-
-                END {
-                    print count+0
-                }
-            ' "$WORKTREE_DATA"
-        )"
-
-        merged_branches="$(
-            awk -F '\t' '
-                $9 == "merged" {
-                    count++
-                }
-
-                END {
-                    print count+0
-                }
-            ' "$BRANCH_DATA"
-        )"
-
-        clear
-        title "Guided Cleanup"
-
-        echo "Recommended cleanup candidates:"
-        echo
-        echo "  Clean worktrees:           $clean_candidates"
-        echo "  Merged-PR local branches:  $merged_branches"
-        echo
-
-        if [[ "$clean_candidates" -eq 0 && "$merged_branches" -eq 0 ]]; then
-            success "No strong cleanup candidates remain."
-            echo
-            gum input --placeholder "Press Enter to return" >/dev/null
-            return
-        fi
-
-        local action
-        action="$(
-            menu \
-                "What should we clean next?" \
-                "Clean worktree candidates" \
-                "Merged-PR local branches" \
-                "Review everything manually" \
-                "Stop guided cleanup"
-        )"
-
-        case "$action" in
-            "Clean worktree candidates")
-                local selected
-                local ids
-
-                selected="$(select_worktrees safe)" || continue
-                [[ -z "$selected" ]] && continue
-
-                ids="$(printf '%s\n' "$selected" | selected_ids)"
-
-                show_worktree_details "$ids"
-
-                if confirm "Remove the selected clean worktrees?"; then
-                    remove_selected_clean_worktrees "$ids"
-                fi
-                ;;
-
-            "Merged-PR local branches")
-                local selected
-                local ids
-
-                selected="$(select_branches merged)" || continue
-                [[ -z "$selected" ]] && continue
-
-                ids="$(printf '%s\n' "$selected" | selected_ids)"
-
-                delete_selected_branches "$ids"
-                ;;
-
-            "Review everything manually")
-                return
-                ;;
-
-            *)
-                return
-                ;;
-        esac
-    done
+    if [[ -n "$branch_ids" ]]; then
+        delete_selected_branches "$branch_ids"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -2107,7 +2818,7 @@ guided_cleanup() {
 # -----------------------------------------------------------------------------
 
 show_final_report() {
-    refresh_repository_state
+    refresh_repository_state_if_stale
 
     clear
     title "Cleanup Summary"
@@ -2143,112 +2854,126 @@ show_final_report() {
 # Main
 # -----------------------------------------------------------------------------
 
-ensure_dependencies
-ensure_github_auth
+#
+# Wrapped in a function, and called only when this file is run rather than
+# sourced, so the tests can load the classification and selection logic and
+# exercise it against a scratch repository. Sourcing a script whose body runs on
+# load means testing it through the interface, which for a gum front end means
+# not testing it at all.
+#
+main() {
+    ensure_dependencies
+    ensure_github_auth
 
-require_git_repository
-check_for_update "$@"
+    require_git_repository
+    check_for_update "$@"
 
-initialize_repository
+    initialize_repository
 
-MENU_HEIGHT="$DEFAULT_HEIGHT"
-LIST_HEIGHT="$DEFAULT_HEIGHT"
+    MENU_HEIGHT="$DEFAULT_HEIGHT"
+    LIST_HEIGHT="$DEFAULT_HEIGHT"
 
-clear
-title "Git Cleanup Assistant"
+    clear
+    title "Git Cleanup Assistant"
 
-echo "Repository:     $REPO_ROOT"
-echo "Primary tree:   $PRIMARY_WORKTREE"
-echo "Primary branch: $PRIMARY_BRANCH"
-echo
+    echo "Repository:     $REPO_ROOT"
+    echo "Primary tree:   $PRIMARY_WORKTREE"
+    echo "Primary branch: $PRIMARY_BRANCH"
+    echo
 
-if confirm "Fetch remote references and prune deleted tracking branches?"; then
-    git fetch --prune
+    if confirm "Fetch remote references and prune deleted tracking branches?"; then
+        git fetch --prune
+    fi
+
+    #
+    # Only asked for what changes an answer.
+    #
+    # The stale threshold used to be the first of two prompts, before the user
+    # had seen anything at all, and it decides nothing: no branch and no worktree
+    # is classified by age. It is a number on the dashboard, so it takes a
+    # default and an environment variable rather than a prompt.
+    #
+    STALE_DAYS="${GIT_CLEANUP_ASSISTANT_STALE_DAYS:-$DEFAULT_STALE_DAYS}"
+
+    if ! [[ "$STALE_DAYS" =~ ^[0-9]+$ ]]; then
+        warning "Invalid stale threshold; using $DEFAULT_STALE_DAYS days."
+        STALE_DAYS="$DEFAULT_STALE_DAYS"
+    fi
+
+    if [[ -n "${GIT_CLEANUP_ASSISTANT_BASE_REF:-}" ]]; then
+        BASE_REF="$GIT_CLEANUP_ASSISTANT_BASE_REF"
+
+        if ! git rev-parse --verify --quiet "$BASE_REF^{commit}" >/dev/null 2>&1; then
+            warning "'$BASE_REF' does not exist; choosing one that does."
+            choose_base_ref
+        fi
+    else
+        choose_base_ref
+    fi
+
+    if [[ "$GH_AVAILABLE" == true ]]; then
+        refresh_pr_cache
+    fi
+
+    refresh_repository_state
+
+    while true; do
+        show_dashboard
+
+        action="$(
+            menu \
+                "What would you like to do?" \
+                "Clean up everything" \
+                "Worktrees" \
+                "Local branches" \
+                "Refresh Git / GitHub data" \
+                "Show remaining summary" \
+                "Finish"
+        )"
+
+        case "$action" in
+            "Clean up everything")
+                clean_up_now
+                ;;
+
+            "Worktrees")
+                worktree_menu
+                ;;
+
+            "Local branches")
+                branch_menu
+                ;;
+
+            "Refresh Git / GitHub data")
+                if confirm "Fetch and prune remotes?"; then
+                    git fetch --prune
+                fi
+
+                if [[ "$GH_AVAILABLE" == true ]]; then
+                    refresh_pr_cache
+                fi
+
+                # Asked for explicitly, so it rescans whether or not this
+                # session changed anything.
+                refresh_repository_state
+                ;;
+
+            "Show remaining summary")
+                show_final_report
+                pause
+                ;;
+
+            "Finish"|*)
+                break
+                ;;
+        esac
+    done
+
+    show_final_report
+
+    success "Cleanup assistant finished."
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
 fi
-
-STALE_DAYS="$(
-    input_value \
-        "Number of days after which inactivity is considered stale" \
-        "$DEFAULT_STALE_DAYS"
-)"
-
-if ! [[ "$STALE_DAYS" =~ ^[0-9]+$ ]]; then
-    warning "Invalid stale threshold; using $DEFAULT_STALE_DAYS days."
-    STALE_DAYS="$DEFAULT_STALE_DAYS"
-fi
-
-BASE_REF="$(
-    input_value \
-        "Base ref used for Git merge checks" \
-        "$DEFAULT_BASE_REF"
-)"
-
-if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
-    warning "'$BASE_REF' does not exist; using $DEFAULT_BASE_REF."
-    BASE_REF="$DEFAULT_BASE_REF"
-fi
-
-if [[ "$GH_AVAILABLE" == true ]]; then
-    refresh_pr_cache
-fi
-
-refresh_repository_state
-
-while true; do
-    show_dashboard
-
-    action="$(
-        menu \
-            "What would you like to do?" \
-            "Clean up now" \
-            "Guided cleanup" \
-            "Worktrees" \
-            "Local branches" \
-            "Refresh Git / GitHub data" \
-            "Show remaining summary" \
-            "Finish"
-    )"
-
-    case "$action" in
-        "Clean up now")
-            clean_up_now
-            ;;
-
-        "Guided cleanup")
-            guided_cleanup
-            ;;
-
-        "Worktrees")
-            worktree_menu
-            ;;
-
-        "Local branches")
-            branch_menu
-            ;;
-
-        "Refresh Git / GitHub data")
-            if confirm "Fetch and prune remotes?"; then
-                git fetch --prune
-            fi
-
-            if [[ "$GH_AVAILABLE" == true ]]; then
-                refresh_pr_cache
-            fi
-
-            refresh_repository_state
-            ;;
-
-        "Show remaining summary")
-            show_final_report
-            gum input --placeholder "Press Enter to continue" >/dev/null
-            ;;
-
-        "Finish"|*)
-            break
-            ;;
-    esac
-done
-
-show_final_report
-
-success "Cleanup assistant finished."
