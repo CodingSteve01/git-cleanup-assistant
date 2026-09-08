@@ -53,6 +53,8 @@ cleanup_tmp() {
 trap cleanup_tmp EXIT INT TERM
 
 WORKTREE_DATA="$TMP_ROOT/worktrees.tsv"
+WORKTREE_LIST="$TMP_ROOT/worktree-list.txt"
+REF_DATA="$TMP_ROOT/refs.tsv"
 BRANCH_DATA="$TMP_ROOT/branches.tsv"
 PR_CACHE="$TMP_ROOT/pr-cache.tsv"
 PR_QUERY="$TMP_ROOT/pr-query.graphql"
@@ -147,18 +149,22 @@ plural_verb() {
     [[ "$1" -eq 1 ]] && echo "needs" || echo "need"
 }
 
+#
+# Set once per scan by refresh_repository_state. Reading the clock per branch and
+# per worktree started a process for every age in the list and could not report a
+# different answer.
+#
+NOW_EPOCH="$(date +%s)"
+
 age_in_days() {
     local epoch="$1"
-    local now
-
-    now=$(date +%s)
 
     if [[ -z "$epoch" || "$epoch" == "0" ]]; then
         echo "?"
         return
     fi
 
-    echo $(( (now - epoch) / 86400 ))
+    echo $(( (NOW_EPOCH - epoch) / 86400 ))
 }
 
 # -----------------------------------------------------------------------------
@@ -422,6 +428,9 @@ initialize_repository() {
 
     REPO_ROOT="$(git rev-parse --show-toplevel)"
 
+    # So the shared lookups have a file to read before the first scan runs.
+    refresh_worktree_list
+
     PRIMARY_WORKTREE="$(
         git worktree list --porcelain |
             awk '/^worktree / { print substr($0, 10); exit }'
@@ -651,11 +660,25 @@ pr_info_for_branch() {
 # Worktree scanning
 # -----------------------------------------------------------------------------
 
+#
+# Re-reads the porcelain worktree list into a file the lookups below share.
+#
+# Every one of those lookups used to run `git worktree list` itself, and they run
+# per branch and per worktree: a repository with 70 branches and 36 worktrees
+# asked git the same question over a hundred times per scan. Reading it once and
+# querying the file costs one git process instead.
+#
+# It is re-read rather than cached for the run, because a worktree can appear or
+# be removed between a scan and an action, and the actions call this first.
+#
+refresh_worktree_list() {
+    git worktree list --porcelain > "$WORKTREE_LIST" 2>/dev/null || : > "$WORKTREE_LIST"
+}
+
 worktree_is_locked() {
     local target="$1"
 
-    git worktree list --porcelain |
-        awk -v target="$target" '
+    awk -v target="$target" '
             /^worktree / {
                 current = substr($0, 10)
             }
@@ -667,7 +690,7 @@ worktree_is_locked() {
             END {
                 exit !found
             }
-        '
+        ' "$WORKTREE_LIST"
 }
 
 worktree_is_dirty() {
@@ -680,115 +703,258 @@ worktree_is_dirty() {
     )" ]]
 }
 
-branch_upstream_track() {
-    local branch="$1"
+#
+# How many worktrees are inspected at once.
+#
+# `git status` is by far the most expensive thing this tool does — in a
+# repository with 36 worktrees it was 15 of the scan's 19 seconds — and it is
+# dominated by waiting on the filesystem, not by CPU. Running a handful at a time
+# turns that wait into overlap. The cap keeps a large worktree set from starting
+# 36 full status walks against one disk at once.
+#
+default_probe_limit() {
+    local cpus
 
+    cpus="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+
+    [[ "$cpus" =~ ^[0-9]+$ ]] || cpus=4
+    [[ "$cpus" -gt 6 ]] && cpus=6
+    [[ "$cpus" -lt 1 ]] && cpus=1
+
+    echo "$cpus"
+}
+
+#
+# Reads committer date, upstream and tracking state for every local branch in one
+# call.
+#
+# Worktrees share the repository's refs, so this is the same answer that running
+# `git log -1` and `git for-each-ref` inside each worktree produced, at one git
+# process instead of three per worktree. Measured on the repository that prompted
+# this: 4.5 seconds down to 0.04.
+#
+write_ref_metadata() {
     git for-each-ref \
-        --format='%(upstream:track)' \
-        "refs/heads/$branch"
+        --format='%(refname:short)%09%(committerdate:short)%09%(committerdate:unix)%09%(upstream:short)%09%(upstream:track)' \
+        refs/heads > "$REF_DATA"
+}
+
+ref_metadata_field() {
+    local branch="$1"
+    local column="$2"
+
+    awk -F '\t' -v branch="$branch" -v column="$column" '
+        $1 == branch {
+            print $column
+            exit
+        }
+    ' "$REF_DATA"
+}
+
+#
+# Answers "is this worktree dirty?" for every worktree, a few at a time.
+#
+# Each probe writes its own file rather than appending to a shared one, so no
+# result can be interleaved with another.
+#
+probe_dirty_states() {
+    local paths="$1"
+    local out="$2"
+
+    local limit
+    local running=0
+    local index=0
+    local total
+    local path
+
+    limit="$(default_probe_limit)"
+    total=$(count_rows "$paths")
+
+    rm -f "$TMP_ROOT"/dirty-probe.* 2>/dev/null || true
+    : > "$out"
+
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+
+        index=$((index + 1))
+
+        probe_one_dirty_state "$path" "$TMP_ROOT/dirty-probe.$index" &
+
+        running=$((running + 1))
+
+        if [[ "$running" -ge "$limit" ]]; then
+            wait
+            running=0
+            show_scan_progress "Reading worktrees" "$index" "$total"
+        fi
+    done < "$paths"
+
+    wait
+
+    show_scan_progress "Reading worktrees" "$total" "$total"
+
+    cat "$TMP_ROOT"/dirty-probe.* > "$out" 2>/dev/null || : > "$out"
+    rm -f "$TMP_ROOT"/dirty-probe.* 2>/dev/null || true
+}
+
+probe_one_dirty_state() {
+    local path="$1"
+    local out="$2"
+
+    if [[ -n "$(
+        git -C "$path" status --porcelain --ignore-submodules=none 2>/dev/null
+    )" ]]; then
+        printf '%s\tDIRTY\n' "$path" > "$out"
+    else
+        printf '%s\tCLEAN\n' "$path" > "$out"
+    fi
+}
+
+dirty_state_of() {
+    local path="$1"
+    local states="$2"
+
+    awk -F '\t' -v path="$path" '
+        $1 == path {
+            print $2
+            exit
+        }
+    ' "$states"
+}
+
+#
+# Turns the porcelain worktree list into one record per worktree: path, branch
+# and whether git holds it locked. All three are in the list already, so no git
+# process is needed per worktree to read them.
+#
+parse_worktree_list() {
+    local out="$1"
+
+    awk -v primary="$PRIMARY_WORKTREE" '
+        function flush() {
+            if (path != "" && path != primary) {
+                printf "%s\t%s\t%s\n", path, (branch == "" ? "(detached)" : branch), locked
+            }
+
+            path = ""
+            branch = ""
+            locked = "false"
+        }
+
+        /^worktree / {
+            flush()
+            path = substr($0, 10)
+            next
+        }
+
+        /^branch refs\/heads\// {
+            branch = substr($0, 20)
+            next
+        }
+
+        /^locked/ {
+            locked = "true"
+            next
+        }
+
+        END {
+            flush()
+        }
+    ' "$WORKTREE_LIST" > "$out"
 }
 
 scan_worktrees() {
     : > "$WORKTREE_DATA"
 
+    refresh_worktree_list
+    write_ref_metadata
+
+    local records="$TMP_ROOT/worktree-records.tsv"
+    local paths="$TMP_ROOT/worktree-paths.txt"
+    local states="$TMP_ROOT/worktree-dirty.tsv"
+
+    parse_worktree_list "$records"
+    cut -f1 "$records" > "$paths"
+
+    probe_dirty_states "$paths" "$states"
+
     local index=0
 
-    git worktree list --porcelain |
-        awk '/^worktree / { print substr($0, 10) }' |
-        while IFS= read -r wt; do
-            [[ "$wt" == "$PRIMARY_WORKTREE" ]] && continue
-            [[ ! -d "$wt" ]] && continue
+    local path
+    local branch
+    local locked
+    local date
+    local epoch
+    local age
+    local track
+    local gone
+    local state
+    local pr_state
+    local pr_number
+    local pr_url
+    local pr_info
 
-            index=$((index + 1))
+    while IFS=$'\t' read -r path branch locked; do
+        [[ -z "$path" ]] && continue
+        [[ ! -d "$path" ]] && continue
 
-            local branch
-            local date
-            local epoch
-            local age
-            local state
-            local upstream
-            local gone
-            local locked
-            local dirty
-            local pr_state
-            local pr_number
-            local pr_url
-            local pr_info
+        index=$((index + 1))
 
-            branch="$(
-                git -C "$wt" branch --show-current 2>/dev/null || true
-            )"
+        date="unknown"
+        epoch="0"
+        gone=false
 
-            [[ -z "$branch" ]] && branch="(detached)"
+        if [[ "$branch" != "(detached)" ]]; then
+            date="$(ref_metadata_field "$branch" 2)"
+            epoch="$(ref_metadata_field "$branch" 3)"
+            track="$(ref_metadata_field "$branch" 5)"
 
-            date="$(
-                git -C "$wt" log -1 --format='%cs' 2>/dev/null ||
-                    echo "unknown"
-            )"
+            [[ -z "$date" ]] && date="unknown"
+            [[ -z "$epoch" ]] && epoch="0"
 
-            epoch="$(
-                git -C "$wt" log -1 --format='%ct' 2>/dev/null ||
-                    echo "0"
-            )"
-
-            age="$(age_in_days "$epoch")"
-
-            dirty=false
-            locked=false
-            gone=false
-
-            if worktree_is_dirty "$wt"; then
-                dirty=true
+            if [[ "$track" == *"[gone]"* ]]; then
+                gone=true
             fi
+        fi
 
-            if worktree_is_locked "$wt"; then
-                locked=true
-            fi
+        age="$(age_in_days "$epoch")"
 
-            upstream=""
+        if [[ "$locked" == "true" ]]; then
+            state="LOCKED"
+        elif [[ "$(dirty_state_of "$path" "$states")" == "DIRTY" ]]; then
+            state="DIRTY"
+        else
+            state="CLEAN"
+        fi
 
-            if [[ "$branch" != "(detached)" ]]; then
-                upstream="$(branch_upstream_track "$branch")"
+        pr_state="unknown"
+        pr_number=""
+        pr_url=""
 
-                if [[ "$upstream" == *"[gone]"* ]]; then
-                    gone=true
-                fi
-            fi
+        if [[ "$branch" != "(detached)" ]]; then
+            pr_info="$(pr_info_for_branch "$branch")"
 
-            if [[ "$locked" == true ]]; then
-                state="LOCKED"
-            elif [[ "$dirty" == true ]]; then
-                state="DIRTY"
-            else
-                state="CLEAN"
-            fi
-
-            pr_state="unknown"
-            pr_number=""
-            pr_url=""
-
-            if [[ "$branch" != "(detached)" ]]; then
-                pr_info="$(pr_info_for_branch "$branch")"
-
-                IFS=$'\t' read -r pr_state pr_number pr_url <<EOF
+            IFS=$'\t' read -r pr_state pr_number pr_url <<EOF
 $pr_info
 EOF
-            fi
+        fi
 
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-                "W$(printf '%05d' "$index")" \
-                "$wt" \
-                "$branch" \
-                "$date" \
-                "$age" \
-                "$state" \
-                "$gone" \
-                "$pr_state" \
-                "$pr_number" \
-                "$pr_url" \
-                "$epoch" \
-                >> "$WORKTREE_DATA"
-        done
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "W$(printf '%05d' "$index")" \
+            "$path" \
+            "$branch" \
+            "$date" \
+            "$age" \
+            "$state" \
+            "$gone" \
+            "$pr_state" \
+            "$pr_number" \
+            "$pr_url" \
+            "$epoch" \
+            >> "$WORKTREE_DATA"
+    done < "$records"
+
+    clear_scan_progress
 }
 
 # -----------------------------------------------------------------------------
@@ -809,8 +975,7 @@ branch_is_checked_out() {
 branch_worktree_path() {
     local branch="$1"
 
-    git worktree list --porcelain |
-        awk -v ref="refs/heads/$branch" '
+    awk -v ref="refs/heads/$branch" '
             /^worktree / {
                 current = substr($0, 10)
             }
@@ -819,7 +984,7 @@ branch_worktree_path() {
                 print current
                 exit
             }
-        '
+        ' "$WORKTREE_LIST"
 }
 
 branch_field() {
@@ -876,6 +1041,9 @@ scan_branches() {
     : > "$BRANCH_DATA"
 
     local index=0
+    local total
+
+    total=$(git for-each-ref --format='%(refname:short)' refs/heads | wc -l | tr -d ' ')
 
     git for-each-ref \
         --sort=committerdate \
@@ -885,6 +1053,8 @@ scan_branches() {
             [[ "$branch" == "$PRIMARY_BRANCH" ]] && continue
 
             index=$((index + 1))
+
+            show_scan_progress "Classifying branches" "$index" "$total"
 
             local age
             local gone=false
@@ -942,19 +1112,60 @@ EOF
                 "$squash_merged" \
                 >> "$BRANCH_DATA"
         done
+
+    clear_scan_progress
 }
 
+#
+# Scanning is the slow part and it has to look like it.
+#
+# The spinner this replaces ran a `bash -c "exit 0"` next to the scan rather than
+# around it: it appeared and vanished, and then the assistant sat silent for the
+# fifteen seconds the scan actually took. gum spin cannot wrap a shell function,
+# so the scanners report their own progress instead, which also makes the two
+# genuinely slow steps visible as what they are — a status call per worktree and
+# a patch comparison per unmerged branch.
+#
 refresh_repository_state() {
-    gum spin \
-        --spinner dot \
-        --title "Scanning repository..." \
-        -- \
-        bash -c "
-            exit 0
-        "
+    NOW_EPOCH="$(date +%s)"
 
     scan_worktrees
     scan_branches
+
+    STATE_IS_STALE=false
+}
+
+#
+# Records that the repository changed under the current scan, so the next menu
+# pass re-reads it. Every deletion path calls this.
+#
+mark_state_stale() {
+    STATE_IS_STALE=true
+}
+
+#
+# Menus used to rescan on every pass through their loop, which meant paying the
+# full scan again after cancelling a filter or backing out of a submenu. The
+# scan is only repeated when something actually changed.
+#
+refresh_repository_state_if_stale() {
+    [[ "${STATE_IS_STALE:-true}" == true ]] || return 0
+
+    refresh_repository_state
+}
+
+show_scan_progress() {
+    local label="$1"
+    local done_count="$2"
+    local total="$3"
+
+    [[ "$total" -gt 0 ]] || return 0
+
+    printf '\r  %s %s/%s' "$label" "$done_count" "$total"
+}
+
+clear_scan_progress() {
+    printf '\r%*s\r' 60 ""
 }
 
 # -----------------------------------------------------------------------------
@@ -1249,12 +1460,14 @@ remove_selected_clean_worktrees() {
         if git worktree remove --force "$path"; then
             success "Removed worktree: $branch"
             count=$((count + 1))
+            mark_state_stale
         else
             warning "Could not remove: $branch"
         fi
     done
 
     git worktree prune
+    refresh_worktree_list
 
     info "Removed $count worktree(s)."
 }
@@ -1318,6 +1531,8 @@ review_dirty_worktree() {
 
                     git worktree remove --force "$path"
                     git worktree prune
+                    refresh_worktree_list
+                    mark_state_stale
                 else
                     info "Confirmation did not match."
                 fi
@@ -1328,7 +1543,7 @@ review_dirty_worktree() {
 
 worktree_menu() {
     while true; do
-        refresh_repository_state
+        refresh_repository_state_if_stale
 
         clear
         title "Worktree Cleanup"
@@ -1625,6 +1840,13 @@ remove_blocking_worktree() {
     local state
     local output
 
+    #
+    # Re-read rather than taken from the scan: a worktree can appear, vanish or
+    # turn dirty between the scan and this prompt, and this is the point where a
+    # wrong answer costs uncommitted work.
+    #
+    refresh_worktree_list
+
     path="$(branch_worktree_path "$branch")"
 
     [[ -z "$path" ]] && return 0
@@ -1674,6 +1896,8 @@ remove_blocking_worktree() {
     fi
 
     git worktree prune
+    refresh_worktree_list
+    mark_state_stale
     success "Removed worktree: $path"
 }
 
@@ -1697,6 +1921,7 @@ force_delete_branch() {
 
     if output="$(git branch -D "$branch" 2>&1)"; then
         success "Deleted${reason:+ ($reason)}: $branch  ·  restore: git branch $branch $hash"
+        mark_state_stale
         return 0
     fi
 
@@ -1999,6 +2224,8 @@ review_branch_individually() {
     branch="$(branch_field "$id" 2)"
     pr="$(branch_field "$id" 9)"
     gone="$(branch_field "$id" 6)"
+
+    refresh_worktree_list
     worktree="$(branch_worktree_path "$branch")"
 
     clear
@@ -2037,6 +2264,7 @@ review_branch_individually() {
 
             if output="$(git branch -d "$branch" 2>&1)"; then
                 success "Deleted branch."
+                mark_state_stale
             else
                 report_git_refusal "$branch" "$output"
                 gum input --placeholder "Press Enter to continue" >/dev/null
@@ -2079,7 +2307,7 @@ review_branch_individually() {
 #
 branch_menu() {
     while true; do
-        refresh_repository_state
+        refresh_repository_state_if_stale
 
         clear
         title "Local Branch Cleanup"
@@ -2138,7 +2366,7 @@ branch_menu() {
 # or going after something the ladder files under "unclear".
 #
 clean_up_now() {
-    refresh_repository_state
+    refresh_repository_state_if_stale
 
     local ids
     ids="$(cut -f1 "$BRANCH_DATA")"
@@ -2161,7 +2389,7 @@ clean_up_now() {
 
 guided_cleanup() {
     while true; do
-        refresh_repository_state
+        refresh_repository_state_if_stale
 
         local clean_candidates
         local merged_branches
@@ -2264,7 +2492,7 @@ guided_cleanup() {
 # -----------------------------------------------------------------------------
 
 show_final_report() {
-    refresh_repository_state
+    refresh_repository_state_if_stale
 
     clear
     title "Cleanup Summary"
@@ -2400,6 +2628,8 @@ main() {
                     refresh_pr_cache
                 fi
 
+                # Asked for explicitly, so it rescans whether or not this
+                # session changed anything.
                 refresh_repository_state
                 ;;
 
