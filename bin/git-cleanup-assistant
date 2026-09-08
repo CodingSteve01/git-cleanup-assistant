@@ -31,6 +31,19 @@ set -u
 #
 VERSION="0.3.0" # x-release-please-version
 
+#
+# Branches that outlive the work merged out of them.
+#
+# A release branch is merged into main and then carries on, so every rung of the
+# ladder reports it as finished and it is exactly the kind of branch a bulk
+# cleanup must never touch. The same is true of develop, staging and the long
+# lived integration branches teams keep.
+#
+# This is a default, not a policy: `git config cleanup-assistant.protected
+# '<regex>'` sets it per repository, which is where the answer actually lives.
+#
+DEFAULT_PROTECTED_PATTERN='^(main|master|develop|development|staging|production|release/.*|support/.*)$'
+
 DEFAULT_STALE_DAYS=30
 DEFAULT_HEIGHT=24
 DEFAULT_BASE_REF="origin/main"
@@ -423,10 +436,43 @@ check_for_update() {
 # Repository information
 # -----------------------------------------------------------------------------
 
+#
+# Repository configuration wins over the built-in default, and the environment
+# wins over both, so a one-off run can widen or narrow it without editing config.
+#
+resolve_protected_pattern() {
+    local configured
+
+    if [[ -n "${GIT_CLEANUP_ASSISTANT_PROTECTED:-}" ]]; then
+        PROTECTED_PATTERN="$GIT_CLEANUP_ASSISTANT_PROTECTED"
+        return
+    fi
+
+    configured="$(git config --get cleanup-assistant.protected 2>/dev/null || true)"
+
+    if [[ -n "$configured" ]]; then
+        PROTECTED_PATTERN="$configured"
+        return
+    fi
+
+    PROTECTED_PATTERN="$DEFAULT_PROTECTED_PATTERN"
+}
+
+branch_is_protected() {
+    local branch="$1"
+
+    [[ -n "$branch" ]] || return 1
+    [[ "$branch" == "(detached)" ]] && return 1
+
+    printf '%s' "$branch" | grep -Eq "${PROTECTED_PATTERN:-$DEFAULT_PROTECTED_PATTERN}"
+}
+
 initialize_repository() {
     require_git_repository
 
     REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+    resolve_protected_pattern
 
     # So the shared lookups have a file to read before the first scan runs.
     refresh_worktree_list
@@ -1066,6 +1112,7 @@ scan_branches() {
             local pr_number
             local pr_url
             local pr_info
+            local protected
 
             age="$(age_in_days "$epoch")"
 
@@ -1097,7 +1144,13 @@ scan_branches() {
 $pr_info
 EOF
 
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            protected=false
+
+            if branch_is_protected "$branch"; then
+                protected=true
+            fi
+
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                 "B$(printf '%05d' "$index")" \
                 "$branch" \
                 "$date" \
@@ -1111,6 +1164,7 @@ EOF
                 "$pr_url" \
                 "$epoch" \
                 "$squash_merged" \
+                "$protected" \
                 >> "$BRANCH_DATA"
         done
 
@@ -1208,11 +1262,17 @@ count_worktree_class() {
                 merged_branch[$2] = 1
             }
 
+            if ($14 == "true") {
+                protected_branch[$2] = 1
+            }
+
             next
         }
 
         {
-            if ($8 == "merged" || merged_branch[$3] == 1)
+            if (protected_branch[$3] == 1)
+                class = "PROTECTED"
+            else if ($8 == "merged" || merged_branch[$3] == 1)
                 class = "MERGED"
             else if ($7 == "true" && $8 != "open")
                 class = "ABANDONED"
@@ -1235,7 +1295,9 @@ count_branch_class() {
 
     awk -F '\t' -v wanted="$wanted" '
         {
-            if ($8 == "true" || $13 == "true" || $9 == "merged")
+            if ($14 == "true")
+                class = "PROTECTED"
+            else if ($8 == "true" || $13 == "true" || $9 == "merged")
                 class = "MERGED"
             else if ($6 == "true" && $9 != "open")
                 class = "ABANDONED"
@@ -1368,6 +1430,11 @@ classify_worktree() {
     gone="$(worktree_field "$id" 7)"
     pr="$(worktree_field "$id" 8)"
 
+    if branch_is_protected "$branch"; then
+        echo "PROTECTED"
+        return
+    fi
+
     git_merged="$(branch_data_field_by_name "$branch" 8)"
     squash_merged="$(branch_data_field_by_name "$branch" 13)"
 
@@ -1424,6 +1491,10 @@ worktree_display_rows() {
                 merged_branch[$2] = 1
             }
 
+            if ($14 == "true") {
+                protected_branch[$2] = 1
+            }
+
             next
         }
 
@@ -1436,7 +1507,9 @@ worktree_display_rows() {
             gone=$7
             pr=$8
 
-            if (pr == "merged" || merged_branch[branch] == 1)
+            if (protected_branch[branch] == 1)
+                class = "PROTECTED"
+            else if (pr == "merged" || merged_branch[branch] == 1)
                 class = "MERGED"
             else if (gone == "true" && pr != "open")
                 class = "ABANDONED"
@@ -1477,7 +1550,7 @@ select_worktrees() {
     preselected="$(
         printf '%s\n' "$rows" |
             awk -F ' \\| ' '
-                $2 ~ /MERGED|ABANDONED/ && $3 ~ /^ *- *$/ {
+                $2 ~ /^ *(MERGED|ABANDONED) *$/ && $3 ~ /^ *- *$/ {
                     print $0
                 }
             ' |
@@ -1603,11 +1676,13 @@ plan_worktree_removals() {
     local abandoned="$TMP_ROOT/wt-plan-abandoned.txt"
     local unknown="$TMP_ROOT/wt-plan-unknown.txt"
     local held="$TMP_ROOT/wt-plan-held.txt"
+    local kept="$TMP_ROOT/wt-plan-kept.txt"
 
     : > "$proven"
     : > "$abandoned"
     : > "$unknown"
     : > "$held"
+    : > "$kept"
 
     local id
     local class
@@ -1623,6 +1698,7 @@ plan_worktree_removals() {
         # here is uncommitted work.
         #
         case "$class" in
+            PROTECTED*)       echo "$id" >> "$kept" ;;
             *:DIRTY|*:LOCKED) echo "$id" >> "$held" ;;
             PROVEN)           echo "$id" >> "$proven" ;;
             ABANDONED)        echo "$id" >> "$abandoned" ;;
@@ -1634,11 +1710,13 @@ plan_worktree_removals() {
     local abandoned_count
     local unknown_count
     local held_count
+    local kept_count
 
     proven_count=$(count_rows "$proven")
     abandoned_count=$(count_rows "$abandoned")
     unknown_count=$(count_rows "$unknown")
     held_count=$(count_rows "$held")
+    kept_count=$(count_rows "$kept")
 
     local clearing=$((proven_count + abandoned_count))
 
@@ -1666,6 +1744,12 @@ plan_worktree_removals() {
     if [[ "$held_count" -gt 0 ]]; then
         echo "  ${CYAN}$held_count${RESET} dirty or locked"
         echo "      never removed in bulk; reviewed one at a time"
+        echo
+    fi
+
+    if [[ "$kept_count" -gt 0 ]]; then
+        echo "  ${CYAN}$kept_count${RESET} kept"
+        echo "      a protected branch is checked out there"
         echo
     fi
 
@@ -1889,13 +1973,16 @@ branch_display_rows() {
             gitmerged=$8
             pr=$9
             squashed=$13
+            protected=$14
 
             #
             # The same ladder classify_branch walks, minus the worktree rungs it
             # cannot see from here. Both read the same fields, so a label in this
             # list and the group in the plan can never disagree.
             #
-            if (gitmerged == "true" || squashed == "true" || pr == "merged")
+            if (protected == "true")
+                class = "PROTECTED"
+            else if (gitmerged == "true" || squashed == "true" || pr == "merged")
                 class = "MERGED"
             else if (gone == "true" && pr != "open")
                 class = "ABANDONED"
@@ -1931,7 +2018,7 @@ select_branches() {
 
     preselected="$(
         printf '%s\n' "$rows" |
-            awk -F ' \\| ' '$2 ~ /MERGED|ABANDONED/' |
+            awk -F ' \\| ' '$2 ~ /^ *(MERGED|ABANDONED) *$/' |
             paste -sd, -
     )"
 
@@ -2116,6 +2203,16 @@ force_delete_branch() {
     local hash
     local output
 
+    #
+    # Checked here as well as in the plan, because this is the function that
+    # actually deletes: every path to a deletion goes through it, so a future
+    # caller cannot route around the protection by accident.
+    #
+    if branch_is_protected "$branch"; then
+        warning "Refusing to delete protected branch '$branch'."
+        return 1
+    fi
+
     hash="$(git rev-parse --short "$branch" 2>/dev/null || echo "?")"
 
     if output="$(git branch -D "$branch" 2>&1)"; then
@@ -2163,6 +2260,16 @@ classify_branch() {
 
     if [[ -n "$path" && "$path" == "$PRIMARY_WORKTREE" ]]; then
         echo "PRIMARY"
+        return
+    fi
+
+    #
+    # Above every rung of evidence, because the evidence is right and the
+    # conclusion is still wrong: a release branch is merged into the base ref and
+    # then carries on being a release branch.
+    #
+    if [[ "$(branch_field "$id" 14)" == "true" ]]; then
+        echo "PROTECTED"
         return
     fi
 
@@ -2252,6 +2359,7 @@ delete_selected_branches() {
 
         case "${class%:WT}" in
             PRIMARY)   echo "$id" >> "$kept" ;;
+            PROTECTED) echo "$id" >> "$kept" ;;
             PROVEN)    echo "$id" >> "$proven" ;;
             ABANDONED) echo "$id" >> "$abandoned" ;;
             UNKNOWN)   echo "$id" >> "$unknown" ;;
@@ -2294,7 +2402,7 @@ delete_selected_branches() {
 
     if [[ "$kept_count" -gt 0 ]]; then
         echo "  ${CYAN}$kept_count${RESET} kept"
-        echo "      checked out in the primary worktree, which always stays"
+        echo "      protected, or checked out in the primary worktree"
         echo
     fi
 
