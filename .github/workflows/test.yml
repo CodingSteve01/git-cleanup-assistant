@@ -1,0 +1,46 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  shell:
+    name: Shell suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Check the syntax
+        run: bash -n bin/git-cleanup-assistant
+
+      - name: Lint
+        run: shellcheck -x bin/git-cleanup-assistant tests/*.sh
+
+      - name: Run the suites
+        run: bash tests/run.sh
+
+  #
+  # The suites build their own repositories and never reach a forge, so the
+  # no-gh path is not a special case that has to be arranged: it is what CI
+  # runs by default. This job only makes that explicit.
+  #
+  macos:
+    name: Shell suite on macOS
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      #
+      # macOS ships Bash 3.2 and that is what users run the assistant with, so
+      # the suite has to pass there rather than only under a modern Bash.
+      #
+      - name: Run the suites with the system Bash
+        run: /bin/bash tests/run.sh

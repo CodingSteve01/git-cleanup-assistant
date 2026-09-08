@@ -2143,112 +2143,125 @@ show_final_report() {
 # Main
 # -----------------------------------------------------------------------------
 
-ensure_dependencies
-ensure_github_auth
+#
+# Wrapped in a function, and called only when this file is run rather than
+# sourced, so the tests can load the classification and selection logic and
+# exercise it against a scratch repository. Sourcing a script whose body runs on
+# load means testing it through the interface, which for a gum front end means
+# not testing it at all.
+#
+main() {
+    ensure_dependencies
+    ensure_github_auth
 
-require_git_repository
-check_for_update "$@"
+    require_git_repository
+    check_for_update "$@"
 
-initialize_repository
+    initialize_repository
 
-MENU_HEIGHT="$DEFAULT_HEIGHT"
-LIST_HEIGHT="$DEFAULT_HEIGHT"
+    MENU_HEIGHT="$DEFAULT_HEIGHT"
+    LIST_HEIGHT="$DEFAULT_HEIGHT"
 
-clear
-title "Git Cleanup Assistant"
+    clear
+    title "Git Cleanup Assistant"
 
-echo "Repository:     $REPO_ROOT"
-echo "Primary tree:   $PRIMARY_WORKTREE"
-echo "Primary branch: $PRIMARY_BRANCH"
-echo
+    echo "Repository:     $REPO_ROOT"
+    echo "Primary tree:   $PRIMARY_WORKTREE"
+    echo "Primary branch: $PRIMARY_BRANCH"
+    echo
 
-if confirm "Fetch remote references and prune deleted tracking branches?"; then
-    git fetch --prune
-fi
+    if confirm "Fetch remote references and prune deleted tracking branches?"; then
+        git fetch --prune
+    fi
 
-STALE_DAYS="$(
-    input_value \
-        "Number of days after which inactivity is considered stale" \
-        "$DEFAULT_STALE_DAYS"
-)"
-
-if ! [[ "$STALE_DAYS" =~ ^[0-9]+$ ]]; then
-    warning "Invalid stale threshold; using $DEFAULT_STALE_DAYS days."
-    STALE_DAYS="$DEFAULT_STALE_DAYS"
-fi
-
-BASE_REF="$(
-    input_value \
-        "Base ref used for Git merge checks" \
-        "$DEFAULT_BASE_REF"
-)"
-
-if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
-    warning "'$BASE_REF' does not exist; using $DEFAULT_BASE_REF."
-    BASE_REF="$DEFAULT_BASE_REF"
-fi
-
-if [[ "$GH_AVAILABLE" == true ]]; then
-    refresh_pr_cache
-fi
-
-refresh_repository_state
-
-while true; do
-    show_dashboard
-
-    action="$(
-        menu \
-            "What would you like to do?" \
-            "Clean up now" \
-            "Guided cleanup" \
-            "Worktrees" \
-            "Local branches" \
-            "Refresh Git / GitHub data" \
-            "Show remaining summary" \
-            "Finish"
+    STALE_DAYS="$(
+        input_value \
+            "Number of days after which inactivity is considered stale" \
+            "$DEFAULT_STALE_DAYS"
     )"
 
-    case "$action" in
-        "Clean up now")
-            clean_up_now
-            ;;
+    if ! [[ "$STALE_DAYS" =~ ^[0-9]+$ ]]; then
+        warning "Invalid stale threshold; using $DEFAULT_STALE_DAYS days."
+        STALE_DAYS="$DEFAULT_STALE_DAYS"
+    fi
 
-        "Guided cleanup")
-            guided_cleanup
-            ;;
+    BASE_REF="$(
+        input_value \
+            "Base ref used for Git merge checks" \
+            "$DEFAULT_BASE_REF"
+    )"
 
-        "Worktrees")
-            worktree_menu
-            ;;
+    if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
+        warning "'$BASE_REF' does not exist; using $DEFAULT_BASE_REF."
+        BASE_REF="$DEFAULT_BASE_REF"
+    fi
 
-        "Local branches")
-            branch_menu
-            ;;
+    if [[ "$GH_AVAILABLE" == true ]]; then
+        refresh_pr_cache
+    fi
 
-        "Refresh Git / GitHub data")
-            if confirm "Fetch and prune remotes?"; then
-                git fetch --prune
-            fi
+    refresh_repository_state
 
-            if [[ "$GH_AVAILABLE" == true ]]; then
-                refresh_pr_cache
-            fi
+    while true; do
+        show_dashboard
 
-            refresh_repository_state
-            ;;
+        action="$(
+            menu \
+                "What would you like to do?" \
+                "Clean up now" \
+                "Guided cleanup" \
+                "Worktrees" \
+                "Local branches" \
+                "Refresh Git / GitHub data" \
+                "Show remaining summary" \
+                "Finish"
+        )"
 
-        "Show remaining summary")
-            show_final_report
-            gum input --placeholder "Press Enter to continue" >/dev/null
-            ;;
+        case "$action" in
+            "Clean up now")
+                clean_up_now
+                ;;
 
-        "Finish"|*)
-            break
-            ;;
-    esac
-done
+            "Guided cleanup")
+                guided_cleanup
+                ;;
 
-show_final_report
+            "Worktrees")
+                worktree_menu
+                ;;
 
-success "Cleanup assistant finished."
+            "Local branches")
+                branch_menu
+                ;;
+
+            "Refresh Git / GitHub data")
+                if confirm "Fetch and prune remotes?"; then
+                    git fetch --prune
+                fi
+
+                if [[ "$GH_AVAILABLE" == true ]]; then
+                    refresh_pr_cache
+                fi
+
+                refresh_repository_state
+                ;;
+
+            "Show remaining summary")
+                show_final_report
+                gum input --placeholder "Press Enter to continue" >/dev/null
+                ;;
+
+            "Finish"|*)
+                break
+                ;;
+        esac
+    done
+
+    show_final_report
+
+    success "Cleanup assistant finished."
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
