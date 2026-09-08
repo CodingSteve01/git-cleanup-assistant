@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/CodingSteve01/git-cleanup-assistant/compare/v0.3.0...v0.4.0) (2026-09-08)
+
+
+### Features
+
+* scale to large repositories and act on the whole selection ([#8](https://github.com/CodingSteve01/git-cleanup-assistant/issues/8)) ([421b931](https://github.com/CodingSteve01/git-cleanup-assistant/commit/421b931c0206efa320092d25d117f7e7f4def894))
+
 ## [0.3.0](https://github.com/CodingSteve01/git-cleanup-assistant/compare/v0.2.1...v0.3.0) (2026-08-25)
 
 
