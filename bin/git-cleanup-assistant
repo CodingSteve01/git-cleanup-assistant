@@ -151,7 +151,7 @@ confirm() {
 # read is a shell builtin, so these two cannot break with a gum release either.
 #
 pause() {
-    printf '%s' "${1:-Press Enter to continue}"
+    printf '%s' "Press Enter to continue"
 
     # A closed stdin (a piped or non-interactive run) must not block the script.
     read -r _ || true

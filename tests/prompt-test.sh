@@ -47,7 +47,7 @@ assert_equals "1" "$([[ "$typed" == "DELETE" ]] && echo 0 || echo 1)"
 # or non-interactive invocation looks like.
 #
 it "returns instead of blocking when stdin is closed"
-assert_equals "0" "$(pause "x" < /dev/null >/dev/null 2>&1 && echo 0 || echo 1)"
+assert_equals "0" "$(pause < /dev/null >/dev/null 2>&1 && echo 0 || echo 1)"
 
 it "reads only one line, leaving the rest for the next prompt"
 result="$(
