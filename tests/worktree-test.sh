@@ -76,6 +76,13 @@ assert_equals \
     "$(worktree_display_rows | grep -c 'MERGED')" \
     "$(count_worktree_class MERGED)"
 
+#
+# The dashboard's classes are exhaustive: a reader has to be able to add the
+# column up and reach the total, which is only true if every class is printed.
+#
+it "prints every class it counts, so the dashboard adds up"
+assert_contains "$(show_dashboard 2>/dev/null)" "Protected"
+
 it "accounts for every branch in exactly one class"
 assert_equals \
     "$(count_rows "$BRANCH_DATA")" \

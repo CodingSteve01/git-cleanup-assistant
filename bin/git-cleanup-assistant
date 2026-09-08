@@ -46,7 +46,6 @@ DEFAULT_PROTECTED_PATTERN='^(main|master|develop|development|staging|production|
 
 DEFAULT_STALE_DAYS=30
 DEFAULT_HEIGHT=24
-DEFAULT_BASE_REF="origin/main"
 
 UPDATE_REPOSITORY="CodingSteve01/git-cleanup-assistant"
 UPDATE_FORMULA="CodingSteve01/tap/git-cleanup-assistant"
@@ -139,6 +138,41 @@ confirm() {
     gum confirm "$1"
 }
 
+#
+# gum input is not used anywhere in this script, and that is deliberate.
+#
+# In gum 2.0.0 it panics the moment its field is empty — which is the state every
+# "Press Enter to continue" starts in, and the state every "Type DELETE" prompt
+# starts in. The user got a Go stack trace where the assistant meant to pause,
+# and the typed confirmation that guards the destructive paths could not be
+# answered at all. gum confirm, gum choose, gum filter and gum pager are fine and
+# still do the interesting work.
+#
+# read is a shell builtin, so these two cannot break with a gum release either.
+#
+pause() {
+    printf '%s' "${1:-Press Enter to continue}"
+
+    # A closed stdin (a piped or non-interactive run) must not block the script.
+    read -r _ || true
+
+    echo
+}
+
+#
+# Prompts on stderr so the answer alone reaches the caller through a command
+# substitution.
+#
+prompt_for_line() {
+    local answer
+
+    printf '%s' "$1" >&2
+
+    read -r answer || answer=""
+
+    printf '%s' "$answer"
+}
+
 menu() {
     local header="$1"
     shift
@@ -147,15 +181,6 @@ menu() {
         gum choose \
             --height "$MENU_HEIGHT" \
             --header "$header"
-}
-
-input_value() {
-    local placeholder="$1"
-    local value="$2"
-
-    gum input \
-        --placeholder "$placeholder" \
-        --value "$value"
 }
 
 plural_verb() {
@@ -402,7 +427,7 @@ check_for_update() {
 
     if ! installed_via_homebrew; then
         info "This copy is not managed by Homebrew; update it the way you installed it."
-        gum input --placeholder "Press Enter to continue" >/dev/null
+        pause
         return
     fi
 
@@ -412,7 +437,7 @@ check_for_update() {
 
     if ! brew upgrade "$UPDATE_FORMULA"; then
         warning "The update failed; continuing with $VERSION."
-        gum input --placeholder "Press Enter to continue" >/dev/null
+        pause
         return
     fi
 
@@ -465,6 +490,78 @@ branch_is_protected() {
     [[ "$branch" == "(detached)" ]] && return 1
 
     printf '%s' "$branch" | grep -Eq "${PROTECTED_PATTERN:-$DEFAULT_PROTECTED_PATTERN}"
+}
+
+#
+# Collects the refs a merge check could sensibly be measured against, best first,
+# and keeps only the ones that exist.
+#
+# origin/HEAD is asked first because it names the remote's default branch, which
+# is the right answer in a repository whose main branch is called something else.
+#
+base_ref_candidates() {
+    {
+        git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true
+
+        [[ -n "$PRIMARY_BRANCH" ]] && printf 'origin/%s\n%s\n' \
+            "$PRIMARY_BRANCH" "$PRIMARY_BRANCH"
+
+        printf '%s\n' origin/main origin/master main master
+    } |
+        awk 'NF && !seen[$0]++' |
+        while IFS= read -r ref; do
+            git rev-parse --verify --quiet "$ref^{commit}" >/dev/null 2>&1 &&
+                printf '%s\n' "$ref"
+        done
+}
+
+#
+# Chosen from what exists rather than typed.
+#
+# Typing it had two failure modes and hit both. gum 2.0.0 panics when the input
+# field is emptied — clearing the pre-filled value to type a different ref kills
+# the prompt — and an unverifiable answer fell back to DEFAULT_BASE_REF, which is
+# the same origin/main that had just failed to resolve. A repository without that
+# ref then measured every branch against something that does not exist, found no
+# evidence anywhere, and called all of them unclear.
+#
+choose_base_ref() {
+    local candidates
+    local count
+
+    candidates="$(base_ref_candidates)"
+
+    if [[ -z "$candidates" ]]; then
+        warning "No usable base ref found; falling back to HEAD."
+        BASE_REF="HEAD"
+        return
+    fi
+
+    count=$(printf '%s\n' "$candidates" | wc -l | tr -d ' ')
+
+    #
+    # Nothing to decide when there is one answer, so it is not asked.
+    #
+    if [[ "$count" -eq 1 ]]; then
+        BASE_REF="$candidates"
+        info "Measuring merge state against $BASE_REF."
+        return
+    fi
+
+    BASE_REF="$(
+        printf '%s\n' "$candidates" |
+            gum choose \
+                --height "$MENU_HEIGHT" \
+                --header "Measure merge state against which ref?"
+    )"
+
+    #
+    # gum exits empty when the choice is cancelled; the best candidate is the
+    # right answer for someone who did not want to pick one.
+    #
+    if [[ -z "$BASE_REF" ]]; then
+        BASE_REF="$(printf '%s\n' "$candidates" | head -1)"
+    fi
 }
 
 initialize_repository() {
@@ -1367,6 +1464,16 @@ show_dashboard() {
         "$(count_worktree_class UNCLEAR)" \
         "$(count_branch_class UNCLEAR)"
 
+    #
+    # Always shown, including as a zero: the four classes are exhaustive, so a
+    # reader can add them up and get the total. Hiding one when it is empty makes
+    # the arithmetic fail exactly when a protected branch appears.
+    #
+    printf "%-18s %8s  %8s\n" \
+        "Protected" \
+        "$(count_worktree_class PROTECTED)" \
+        "$(count_branch_class PROTECTED)"
+
     echo
     printf "%-18s %8s\n" "Dirty worktrees" "$(count_worktree_state DIRTY)"
     printf "%-18s %8s\n" "Locked worktrees" "$(count_worktree_state LOCKED)"
@@ -1543,7 +1650,7 @@ select_worktrees() {
 
     if [[ -z "$rows" ]]; then
         warning "No worktrees besides the primary one."
-        gum input --placeholder "Press Enter to continue" >/dev/null
+        pause
         return 1
     fi
 
@@ -1755,7 +1862,7 @@ plan_worktree_removals() {
 
     if [[ "$clearing" -eq 0 && "$unknown_count" -eq 0 && "$held_count" -eq 0 ]]; then
         warning "Nothing in this selection can be removed."
-        gum input --placeholder "Press Enter to continue" >/dev/null
+        pause
         return
     fi
 
@@ -1798,7 +1905,7 @@ plan_worktree_removals() {
     fi
 
     echo
-    gum input --placeholder "Press Enter to continue" >/dev/null
+    pause
 }
 
 #
@@ -1891,10 +1998,7 @@ review_dirty_worktree() {
             if confirm "Really delete worktree '$branch'?"; then
                 local typed
 
-                typed="$(
-                    gum input \
-                        --placeholder "Type DELETE to confirm"
-                )"
+                typed="$(prompt_for_line "Type DELETE to confirm: ")"
 
                 if [[ "$typed" == "DELETE" ]]; then
                     if [[ "$state" == "LOCKED" ]]; then
@@ -2012,7 +2116,7 @@ select_branches() {
 
     if [[ -z "$rows" ]]; then
         warning "No local branches besides ${PRIMARY_BRANCH:-the primary branch}."
-        gum input --placeholder "Press Enter to continue" >/dev/null
+        pause
         return 1
     fi
 
@@ -2163,7 +2267,7 @@ remove_blocking_worktree() {
 
     if [[ "$state" == "DIRTY" ]]; then
         local typed
-        typed="$(gum input --placeholder "Type DELETE to discard the changes")"
+        typed="$(prompt_for_line "Type DELETE to discard the changes: ")"
 
         if [[ "$typed" != "DELETE" ]]; then
             info "Confirmation did not match; keeping '$branch'."
@@ -2413,7 +2517,7 @@ delete_selected_branches() {
 
     if [[ "$clearing" -eq 0 && "$unknown_count" -eq 0 ]]; then
         warning "Nothing in this selection can be deleted."
-        gum input --placeholder "Press Enter to continue" >/dev/null
+        pause
         return
     fi
 
@@ -2441,7 +2545,7 @@ delete_selected_branches() {
     fi
 
     echo
-    gum input --placeholder "Press Enter to continue" >/dev/null
+    pause
 }
 
 #
@@ -2500,7 +2604,7 @@ run_forced_deletions() {
     fi
 
     local typed
-    typed="$(gum input --placeholder "Type DELETE to confirm")"
+    typed="$(prompt_for_line "Type DELETE to confirm: ")"
 
     if [[ "$typed" != "DELETE" ]]; then
         warning "Confirmation did not match; kept all $count."
@@ -2550,7 +2654,7 @@ review_branch_individually() {
         echo
 
         if ! remove_blocking_worktree "$branch"; then
-            gum input --placeholder "Press Enter to continue" >/dev/null
+            pause
             return
         fi
     fi
@@ -2574,7 +2678,7 @@ review_branch_individually() {
                 mark_state_stale
             else
                 report_git_refusal "$branch" "$output"
-                gum input --placeholder "Press Enter to continue" >/dev/null
+                pause
             fi
             ;;
 
@@ -2590,10 +2694,7 @@ review_branch_individually() {
             if confirm "Force delete '$branch'?"; then
                 local typed
 
-                typed="$(
-                    gum input \
-                        --placeholder "Type DELETE to confirm"
-                )"
+                typed="$(prompt_for_line "Type DELETE to confirm: ")"
 
                 if [[ "$typed" == "DELETE" ]]; then
                     force_delete_branch "$branch"
@@ -2697,7 +2798,7 @@ clean_up_now() {
         title "Clean Up"
         success "Nothing here besides ${PRIMARY_BRANCH:-the primary branch}."
         echo
-        gum input --placeholder "Press Enter to continue" >/dev/null
+        pause
         return
     fi
 
@@ -2799,15 +2900,15 @@ main() {
         STALE_DAYS="$DEFAULT_STALE_DAYS"
     fi
 
-    BASE_REF="$(
-        input_value \
-            "Base ref used for Git merge checks" \
-            "$DEFAULT_BASE_REF"
-    )"
+    if [[ -n "${GIT_CLEANUP_ASSISTANT_BASE_REF:-}" ]]; then
+        BASE_REF="$GIT_CLEANUP_ASSISTANT_BASE_REF"
 
-    if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
-        warning "'$BASE_REF' does not exist; using $DEFAULT_BASE_REF."
-        BASE_REF="$DEFAULT_BASE_REF"
+        if ! git rev-parse --verify --quiet "$BASE_REF^{commit}" >/dev/null 2>&1; then
+            warning "'$BASE_REF' does not exist; choosing one that does."
+            choose_base_ref
+        fi
+    else
+        choose_base_ref
     fi
 
     if [[ "$GH_AVAILABLE" == true ]]; then
@@ -2859,7 +2960,7 @@ main() {
 
             "Show remaining summary")
                 show_final_report
-                gum input --placeholder "Press Enter to continue" >/dev/null
+                pause
                 ;;
 
             "Finish"|*)
