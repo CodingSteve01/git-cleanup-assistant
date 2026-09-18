@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/CodingSteve01/git-cleanup-assistant/compare/v0.4.0...v0.5.0) (2026-09-18)
+
+
+### Features
+
+* name what every prompt acts on and never dump a list ([#10](https://github.com/CodingSteve01/git-cleanup-assistant/issues/10)) ([ce62126](https://github.com/CodingSteve01/git-cleanup-assistant/commit/ce6212645996f6a50b9e4a7f48987926a404bb56))
+
 ## [0.4.0](https://github.com/CodingSteve01/git-cleanup-assistant/compare/v0.3.0...v0.4.0) (2026-09-08)
 
 
