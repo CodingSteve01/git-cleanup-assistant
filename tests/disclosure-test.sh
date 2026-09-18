@@ -115,8 +115,17 @@ it "shortens a path under the home directory, where the end is the useful half"
 expected="$(printf '~%s' "/worktrees/voffice/x")"
 assert_equals "$expected" "$(short_path "$HOME/worktrees/voffice/x")"
 
+it "shortens the home directory itself"
+assert_equals "$(printf '~')" "$(short_path "$HOME")"
+
 it "leaves a path outside the home directory alone"
 assert_equals "/opt/repos/x" "$(short_path "/opt/repos/x")"
+
+#
+# A prefix match, not a string match: /home/runner-2 is not inside /home/runner.
+#
+it "does not shorten a path that merely starts with the same letters"
+assert_equals "${HOME}-elsewhere/x" "$(short_path "${HOME}-elsewhere/x")"
 
 echo
 echo "Evidence read out in words"

@@ -323,8 +323,24 @@ preview_file() {
 #
 short_path() {
     local path="$1"
+    local home="${HOME:-}"
 
-    printf '%s' "${path/#$HOME/~}"
+    #
+    # Written out rather than `${path/#$HOME/~}`, which is not portable: some
+    # bash releases tilde-expand the replacement, so the substitution puts the
+    # home directory straight back and the path comes out unchanged.
+    #
+    if [[ -n "$home" && "$path" == "$home" ]]; then
+        printf '~'
+        return
+    fi
+
+    if [[ -n "$home" && "$path" == "$home"/* ]]; then
+        printf '~%s' "${path#"$home"}"
+        return
+    fi
+
+    printf '%s' "$path"
 }
 
 #
