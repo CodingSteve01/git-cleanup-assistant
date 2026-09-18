@@ -145,24 +145,53 @@ echo "Confirmations that can be checked before they are answered"
 
 #
 # gum never runs here: the pager is stubbed out and the menu is scripted, so the
-# confirmation is exercised without a terminal. Both are called through
-# confirm_with_details rather than from this file, which is what shellcheck is
-# told below.
+# confirmation is exercised without a terminal.
 #
-# shellcheck disable=SC2329
-gum() { cat >/dev/null 2>&1 || true; }
+# One definition of each, driven by variables rather than redefined per case:
+# redefining a function makes the earlier body look unreachable, which the older
+# linter releases report and the newer ones do not.
+#
+MENU_ANSWER=""
+MENU_SECOND_ANSWER=""
+MENU_CALLS_FILE="$WORK/menu-calls"
+MENU_OFFERED_FILE="$WORK/menu-offered"
+
+: > "$MENU_CALLS_FILE"
+
+# shellcheck disable=SC2317,SC2329
+gum() {
+    cat >/dev/null 2>&1 || true
+}
+
+# shellcheck disable=SC2317,SC2329
+menu() {
+    shift
+    printf '%s\n' "$@" > "$MENU_OFFERED_FILE"
+    echo call >> "$MENU_CALLS_FILE"
+
+    if [[ -n "$MENU_SECOND_ANSWER" ]] && [[ "$(count_rows "$MENU_CALLS_FILE")" -gt 1 ]]; then
+        echo "$MENU_SECOND_ANSWER"
+        return 0
+    fi
+
+    echo "$MENU_ANSWER"
+}
+
+answers_to() {
+    MENU_ANSWER="$1"
+    MENU_SECOND_ANSWER="${2:-}"
+    : > "$MENU_CALLS_FILE"
+}
 
 it "confirms when the affirmative is chosen"
-# shellcheck disable=SC2329
-menu() { echo "Remove these 3 worktrees"; }
+answers_to "Remove these 3 worktrees"
 assert_equals "0" "$(
     confirm_with_details "3 worktrees" "Remove these 3 worktrees" "$WORK/long.txt" \
         >/dev/null && echo 0 || echo 1
 )"
 
 it "skips when the question is declined"
-# shellcheck disable=SC2329
-menu() { echo "Keep them"; }
+answers_to "Keep them, decide later"
 assert_equals "1" "$(
     confirm_with_details "3 worktrees" "Remove these 3 worktrees" "$WORK/long.txt" \
         >/dev/null && echo 0 || echo 1
@@ -173,36 +202,23 @@ assert_equals "1" "$(
 # question must never read as a yes.
 #
 it "treats a cancelled menu as a no"
-# shellcheck disable=SC2329
-menu() { echo ""; }
+answers_to ""
 assert_equals "1" "$(
     confirm_with_details "3 worktrees" "Remove these 3 worktrees" "$WORK/long.txt" \
         >/dev/null && echo 0 || echo 1
 )"
 
 it "asks again after the full list was shown, rather than deciding by itself"
-MENU_CALLS_FILE="$WORK/menu-calls"
-: > "$MENU_CALLS_FILE"
-# shellcheck disable=SC2329
-menu() {
-    echo call >> "$MENU_CALLS_FILE"
-
-    if [[ "$(count_rows "$MENU_CALLS_FILE")" -eq 1 ]]; then
-        echo "Show all 12 first"
-    else
-        echo "Keep them"
-    fi
-}
+answers_to "Show all 12 first" "Keep them, decide later"
 confirm_with_details "3 worktrees" "Remove these 3 worktrees" "$WORK/long.txt" \
     >/dev/null 2>&1 || true
 assert_equals "2" "$(count_rows "$MENU_CALLS_FILE")"
 
 it "offers the full list with its length, so its size is known before it opens"
-# shellcheck disable=SC2329
-menu() { printf '%s\n' "$@" > "$WORK/offered"; echo ""; }
+answers_to ""
 confirm_with_details "3 worktrees" "Remove these 3 worktrees" "$WORK/long.txt" \
     >/dev/null 2>&1 || true
-assert_contains "$(cat "$WORK/offered")" "Show all 12"
+assert_contains "$(cat "$MENU_OFFERED_FILE")" "Show all 12"
 
 unset -f menu
 unset -f gum

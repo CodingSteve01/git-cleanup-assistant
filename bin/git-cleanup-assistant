@@ -217,10 +217,11 @@ plural_verb() {
 # The subtracted rows are the header block above the preview and the menu gum
 # draws below it.
 #
+# The row count is passed in rather than read here, so the arithmetic is a
+# function of its argument and can be tested without a terminal.
 preview_limit_for_terminal() {
-    local rows="${1:-}"
+    local rows="$1"
 
-    [[ -z "$rows" ]] && rows="$(tput lines 2>/dev/null || echo 24)"
     [[ "$rows" =~ ^[0-9]+$ ]] || rows=24
 
     local limit=$((rows - 18))
@@ -231,7 +232,7 @@ preview_limit_for_terminal() {
     echo "$limit"
 }
 
-PREVIEW_LIMIT="$(preview_limit_for_terminal)"
+PREVIEW_LIMIT="$(preview_limit_for_terminal "$(tput lines 2>/dev/null || echo 24)")"
 
 #
 # Turns porcelain status output on stdin into "412 changes: 5 modified, 400
