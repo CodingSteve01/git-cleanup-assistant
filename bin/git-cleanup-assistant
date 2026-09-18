@@ -187,6 +187,240 @@ plural_verb() {
     [[ "$1" -eq 1 ]] && echo "needs" || echo "need"
 }
 
+# -----------------------------------------------------------------------------
+# Naming what is at stake
+# -----------------------------------------------------------------------------
+
+#
+# Nothing here asks a question without saying what it acts on, and no list it
+# shows is longer than the screen it is shown on.
+#
+# The screen that made this a rule was the review of a dirty worktree: its
+# `git status` went straight to the terminal, so four hundred changed files
+# pushed the branch name, the path and the state out of the scrollback — and
+# there is no scrolling back once a full-screen prompt has drawn over it. The
+# question underneath them read "What should happen to this worktree?" without
+# naming which one, and the option that discards the work sat two keystrokes
+# below a screen that no longer said whose work it was.
+#
+# Three rules, applied at every prompt in this file:
+#   - the header names its subject, and its position when it is one of several
+#   - a list is previewed to a fixed number of lines and the remainder counted
+#   - the full list is one menu entry away, in a pager that scrolls
+#
+#
+# How many lines of a list are previewed before the rest is counted.
+#
+# It is derived from the terminal rather than fixed, because a bounded preview
+# that does not fit is only a shorter dump: it still pushes the subject of the
+# question off the top of the screen, which is the whole failure this replaces.
+# The subtracted rows are the header block above the preview and the menu gum
+# draws below it.
+#
+preview_limit_for_terminal() {
+    local rows="${1:-}"
+
+    [[ -z "$rows" ]] && rows="$(tput lines 2>/dev/null || echo 24)"
+    [[ "$rows" =~ ^[0-9]+$ ]] || rows=24
+
+    local limit=$((rows - 18))
+
+    [[ "$limit" -lt 3 ]] && limit=3
+    [[ "$limit" -gt 12 ]] && limit=12
+
+    echo "$limit"
+}
+
+PREVIEW_LIMIT="$(preview_limit_for_terminal)"
+
+#
+# Turns porcelain status output on stdin into "412 changes: 5 modified, 400
+# deleted, 7 untracked".
+#
+# The kinds carry the decision, not the total: four hundred deletions in a
+# worktree whose branch was merged months ago is a directory somebody emptied and
+# forgot, and four hundred modifications is a day of unsaved work. Both of them
+# read as "400 changes".
+#
+summarize_changes() {
+    awk '
+        {
+            code = substr($0, 1, 2)
+
+            if (code == "??")                                kind = "untracked"
+            else if (code ~ /U/ || code == "AA" || code == "DD") kind = "conflicted"
+            else if (code ~ /[RC]/)                          kind = "renamed"
+            else if (code ~ /D/)                             kind = "deleted"
+            else if (code ~ /A/)                             kind = "added"
+            else                                             kind = "modified"
+
+            count[kind]++
+            total++
+        }
+
+        END {
+            if (total == 0) {
+                print "no uncommitted changes"
+                exit
+            }
+
+            n = split("modified deleted added untracked renamed conflicted", kinds, " ")
+            detail = ""
+
+            for (i = 1; i <= n; i++) {
+                kind = kinds[i]
+
+                if (count[kind] > 0) {
+                    detail = detail (detail == "" ? "" : ", ") count[kind] " " kind
+                }
+            }
+
+            printf "%d change%s: %s\n", total, (total == 1 ? "" : "s"), detail
+        }
+    '
+}
+
+#
+# Writes a worktree's uncommitted changes to a file and answers the summary of
+# them. The file is what the preview and the pager read, so the full list stays
+# available without a second status call — the expensive one in this tool.
+#
+describe_changes() {
+    local path="$1"
+    local out="$2"
+
+    git -C "$path" status --porcelain --ignore-submodules=none > "$out" 2>/dev/null ||
+        : > "$out"
+
+    summarize_changes < "$out"
+}
+
+#
+# Prints at most $2 lines of a file, indented, and counts what it held back.
+#
+preview_file() {
+    local file="$1"
+    local limit="${2:-$PREVIEW_LIMIT}"
+    local indent="${3:-    }"
+
+    local total
+    total=$(count_rows "$file")
+
+    [[ "$total" -eq 0 ]] && return 0
+
+    sed -n "1,${limit}p" "$file" | sed "s/^/$indent/"
+
+    if [[ "$total" -gt "$limit" ]]; then
+        echo "${indent}… and $((total - limit)) more"
+    fi
+}
+
+#
+# Shortens a path for the previews, where the interesting half of it is the end.
+# A worktree path under $HOME is a third of the line otherwise, and the previews
+# have to fit on an 80-column terminal.
+#
+short_path() {
+    local path="$1"
+
+    printf '%s' "${path/#$HOME/~}"
+}
+
+#
+# "feature/x (2 of 7)" while a run works through a list, "feature/x" when the
+# subject is alone: a review that stops seven times says which stop this is.
+#
+subject_with_position() {
+    local subject="$1"
+    local index="${2:-}"
+    local total="${3:-}"
+
+    if [[ -n "$index" && -n "$total" && "$total" -gt 1 ]]; then
+        printf '%s (%s of %s)' "$subject" "$index" "$total"
+    else
+        printf '%s' "$subject"
+    fi
+}
+
+#
+# The sentence behind each rung of the evidence ladder, so a rung's name is never
+# the only thing the user is given to decide on.
+#
+describe_evidence() {
+    case "$1" in
+        PROVEN | MERGED)
+            echo "the branch is already on $BASE_REF"
+            ;;
+        ABANDONED)
+            echo "the remote branch was deleted and no pull request is open"
+            ;;
+        PROTECTED)
+            echo "a protected branch, which this tool never deletes"
+            ;;
+        PRIMARY)
+            echo "the primary worktree, which always stays"
+            ;;
+        *)
+            echo "no signal either way that the work landed"
+            ;;
+    esac
+}
+
+#
+# "unknown" is the pull request state when no forge was asked, and it reads on a
+# review screen as if the forge had been asked and shrugged. The difference
+# decides how much the rest of the screen is worth.
+#
+describe_pr_state() {
+    case "$1" in
+        merged | open | closed)
+            echo "$1"
+            ;;
+        none)
+            echo "none found"
+            ;;
+        *)
+            echo "not checked — no GitHub data for this run"
+            ;;
+    esac
+}
+
+#
+# A confirmation whose subject can be read in full before it is answered.
+#
+# gum confirm shows a single line, so a group confirmation could only name a
+# count — "Remove these 12 worktrees?" with the twelve names somewhere above it,
+# off the top of a screen that does not scroll. The same question as a menu keeps
+# the full list one entry away in a pager and asks again when that pager closes.
+# A cancelled menu answers no.
+#
+confirm_with_details() {
+    local header="$1"
+    local affirmative="$2"
+    local details="$3"
+
+    local show
+    local choice
+
+    show="Show all $(count_rows "$details") first"
+
+    while true; do
+        choice="$(menu "$header" "$affirmative" "$show" "Keep them, decide later")"
+
+        case "$choice" in
+            "$affirmative")
+                return 0
+                ;;
+            "$show")
+                gum pager < "$details"
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    done
+}
+
 #
 # Set once per scan by refresh_repository_state. Reading the clock per branch and
 # per worktree started a process for every age in the list and could not report a
@@ -1747,10 +1981,22 @@ show_worktree_details() {
         path="$(awk -F '\t' -v id="$id" '$1 == id { print $2 }' "$WORKTREE_DATA")"
 
         if [[ -d "$path" ]]; then
-            echo "Status:" >> "$detail_file"
-            git -C "$path" status --short --ignore-submodules=none \
-                >> "$detail_file" 2>&1 || true
-            echo >> "$detail_file"
+            local changes="$TMP_ROOT/detail-changes.txt"
+            local summary
+
+            summary="$(describe_changes "$path" "$changes")"
+
+            #
+            # The summary first, then the list it summarises: a hundred lines of
+            # porcelain do not say at a glance whether this is a day of work or a
+            # directory somebody emptied.
+            #
+            {
+                echo "Changes:     $summary"
+                echo
+                cat "$changes"
+                echo
+            } >> "$detail_file"
 
             echo "Recent commits:" >> "$detail_file"
             git -C "$path" log \
@@ -1764,6 +2010,32 @@ show_worktree_details() {
     done
 
     gum pager < "$detail_file"
+}
+
+#
+# One readable line per worktree — class, age, branch, path — for the previews on
+# the plan screen and for the pager behind them.
+#
+# The plan used to name a count per group and nothing else, so a bulk removal
+# could be confirmed without a single name in it ever having been on screen.
+#
+write_worktree_rows() {
+    local ids="$1"
+    local out="$2"
+
+    : > "$out"
+
+    local id
+
+    load_ids "$ids"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+        printf '%-14s %4sd  %-38s %s\n' \
+            "$(classify_worktree "$id")" \
+            "$(worktree_field "$id" 5)" \
+            "$(worktree_field "$id" 3)" \
+            "$(short_path "$(worktree_field "$id" 2)")" >> "$out"
+    done
 }
 
 #
@@ -1784,6 +2056,13 @@ plan_worktree_removals() {
     local unknown="$TMP_ROOT/wt-plan-unknown.txt"
     local held="$TMP_ROOT/wt-plan-held.txt"
     local kept="$TMP_ROOT/wt-plan-kept.txt"
+
+    local proven_rows="$TMP_ROOT/wt-rows-proven.txt"
+    local abandoned_rows="$TMP_ROOT/wt-rows-abandoned.txt"
+    local unknown_rows="$TMP_ROOT/wt-rows-unknown.txt"
+    local held_rows="$TMP_ROOT/wt-rows-held.txt"
+    local kept_rows="$TMP_ROOT/wt-rows-kept.txt"
+    local clearing_rows="$TMP_ROOT/wt-rows-clearing.txt"
 
     : > "$proven"
     : > "$abandoned"
@@ -1827,36 +2106,53 @@ plan_worktree_removals() {
 
     local clearing=$((proven_count + abandoned_count))
 
+    #
+    # Written before anything is printed, because every group below shows its
+    # members rather than only counting them.
+    #
+    write_worktree_rows "$(cat "$proven")" "$proven_rows"
+    write_worktree_rows "$(cat "$abandoned")" "$abandoned_rows"
+    write_worktree_rows "$(cat "$unknown")" "$unknown_rows"
+    write_worktree_rows "$(cat "$held")" "$held_rows"
+    write_worktree_rows "$(cat "$kept")" "$kept_rows"
+
+    cat "$proven_rows" "$abandoned_rows" > "$clearing_rows"
+
     clear
     title "Worktree Removal Plan"
 
     if [[ "$proven_count" -gt 0 ]]; then
         echo "  ${GREEN}$proven_count${RESET} merged"
         echo "      the branch is already on $BASE_REF"
+        preview_file "$proven_rows" "$PREVIEW_LIMIT" "      "
         echo
     fi
 
     if [[ "$abandoned_count" -gt 0 ]]; then
         echo "  ${GREEN}$abandoned_count${RESET} abandoned"
         echo "      the remote branch was deleted and no pull request is open"
+        preview_file "$abandoned_rows" "$PREVIEW_LIMIT" "      "
         echo
     fi
 
     if [[ "$unknown_count" -gt 0 ]]; then
         echo "  ${YELLOW}$unknown_count${RESET} unclear"
         echo "      no signal either way; confirmed separately"
+        preview_file "$unknown_rows" "$PREVIEW_LIMIT" "      "
         echo
     fi
 
     if [[ "$held_count" -gt 0 ]]; then
         echo "  ${CYAN}$held_count${RESET} dirty or locked"
         echo "      never removed in bulk; reviewed one at a time"
+        preview_file "$held_rows" "$PREVIEW_LIMIT" "      "
         echo
     fi
 
     if [[ "$kept_count" -gt 0 ]]; then
         echo "  ${CYAN}$kept_count${RESET} kept"
         echo "      a protected branch is checked out there"
+        preview_file "$kept_rows" "$PREVIEW_LIMIT" "      "
         echo
     fi
 
@@ -1871,7 +2167,11 @@ plan_worktree_removals() {
         echo "uncommitted changes, and the branch stays where it is."
         echo
 
-        if confirm "Remove these $clearing worktrees?"; then
+        if confirm_with_details \
+            "Remove $clearing worktree(s) whose work landed?" \
+            "Remove these $clearing worktrees" \
+            "$clearing_rows"
+        then
             echo
             remove_worktrees_from_list "$proven"
             remove_worktrees_from_list "$abandoned"
@@ -1885,22 +2185,35 @@ plan_worktree_removals() {
         warning "$unknown_count worktree(s) carry no evidence that their work landed."
         echo "They are clean, so nothing uncommitted is lost, but the branch may"
         echo "still be unfinished."
+        preview_file "$unknown_rows" "$PREVIEW_LIMIT" "    "
         echo
 
-        if confirm "Remove these $unknown_count as well?"; then
+        if confirm_with_details \
+            "Remove $unknown_count worktree(s) with no evidence either way?" \
+            "Remove these $unknown_count as well" \
+            "$unknown_rows"
+        then
             remove_worktrees_from_list "$unknown"
         else
             info "Kept all $unknown_count."
         fi
     fi
 
+    #
+    # One at a time, and each review says which of the held worktrees it is: the
+    # loop used to ask the same anonymous question $held_count times, so there
+    # was no way to tell the fourth screen from the first.
+    #
     if [[ "$held_count" -gt 0 ]]; then
         local held_id
+        local held_index=0
 
         load_ids "$(cat "$held")"
 
         for held_id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
-            review_dirty_worktree "$held_id"
+            held_index=$((held_index + 1))
+
+            review_dirty_worktree "$held_id" "$held_index" "$held_count" || break
         done
     fi
 
@@ -1951,70 +2264,148 @@ remove_worktrees_from_list() {
     return 0
 }
 
+#
+# One dirty or locked worktree, with everything its removal turns on on a single
+# screen: which worktree this is, where it sits, which stop of the review it is,
+# what the evidence says about its branch, and what exactly is uncommitted in it.
+#
+# What stood here printed `git status --short` straight to the terminal. In a
+# worktree with four hundred changed files that pushed the branch, the path and
+# the state out of reach — a full-screen prompt draws over the scrollback, so
+# they could not be scrolled back to — and then asked "What should happen to this
+# worktree?" without naming one. The list is previewed and counted here, and the
+# whole of it stays one menu entry away in a pager.
+#
+# Returning 1 ends the review of the remaining worktrees, so a run of seven can
+# be stopped after the second without answering five more questions.
+#
 review_dirty_worktree() {
     local id="$1"
+    local index="${2:-}"
+    local total="${3:-}"
 
     local path
     local branch
     local state
+    local class
+    local subject
+    local summary
+    local count
 
-    path="$(awk -F '\t' -v id="$id" '$1 == id { print $2 }' "$WORKTREE_DATA")"
-    branch="$(awk -F '\t' -v id="$id" '$1 == id { print $3 }' "$WORKTREE_DATA")"
-    state="$(awk -F '\t' -v id="$id" '$1 == id { print $6 }' "$WORKTREE_DATA")"
+    local changes="$TMP_ROOT/worktree-changes.txt"
 
-    clear
-    title "$branch"
+    path="$(worktree_field "$id" 2)"
+    branch="$(worktree_field "$id" 3)"
+    state="$(worktree_field "$id" 6)"
+    class="$(classify_worktree "$id")"
 
-    echo "Path:  $path"
-    echo "State: $state"
-    echo
+    subject="$(subject_with_position "$branch" "$index" "$total")"
 
-    git -C "$path" status --short --ignore-submodules=none || true
+    #
+    # Read live rather than taken from the scan: this screen is the one that
+    # decides whether uncommitted work is destroyed, and a worktree can have
+    # changed since the scan.
+    #
+    summary="$(describe_changes "$path" "$changes")"
+    count=$(count_rows "$changes")
 
-    echo
+    local discard
+    local typed_prompt
 
+    if [[ "$count" -gt 0 ]]; then
+        discard="Remove worktree and DISCARD $count change(s)"
+        typed_prompt="Type DELETE to discard $count change(s) in '$branch': "
+    else
+        discard="Remove this worktree"
+        typed_prompt="Type DELETE to remove the worktree of '$branch': "
+    fi
+
+    local entries
     local action
-    action="$(
-        menu \
-            "What should happen to this worktree?" \
-            "Keep" \
-            "Show recent commits" \
-            "Remove and DISCARD local changes" \
-            "Back"
-    )"
 
-    case "$action" in
-        "Show recent commits")
-            git -C "$path" log \
-                -15 \
-                --date=short \
-                --format='%h %ad %s' |
-                gum pager
-            ;;
+    while true; do
+        clear
+        title "$subject"
 
-        "Remove and DISCARD local changes")
-            warning "This will permanently discard local changes."
+        echo "Worktree:    $(short_path "$path")"
+        echo "Branch:      $branch"
+        echo "Last commit: $(worktree_field "$id" 4) ($(worktree_field "$id" 5) days ago)"
+        echo "Evidence:    ${class%%:*} — $(describe_evidence "${class%%:*}")"
+        echo "State:       $state — $summary"
+        echo
 
-            if confirm "Really delete worktree '$branch'?"; then
-                local typed
+        preview_file "$changes" "$PREVIEW_LIMIT"
+        echo
 
-                typed="$(prompt_for_line "Type DELETE to confirm: ")"
+        entries=("Keep this worktree and move on")
 
-                if [[ "$typed" == "DELETE" ]]; then
-                    if [[ "$state" == "LOCKED" ]]; then
-                        git worktree unlock "$path" || true
-                    fi
+        [[ "$count" -gt 0 ]] && entries[${#entries[@]}]="Show all $count changes"
 
-                    git worktree remove --force "$path"
-                    git worktree prune
-                    refresh_worktree_list
-                    mark_state_stale
-                else
-                    info "Confirmation did not match."
+        entries[${#entries[@]}]="Show recent commits"
+        entries[${#entries[@]}]="$discard"
+        entries[${#entries[@]}]="Stop reviewing the rest"
+
+        action="$(menu "$subject — $summary. What should happen?" "${entries[@]}")"
+
+        case "$action" in
+            "Show all "*)
+                gum pager < "$changes"
+                ;;
+
+            "Show recent commits")
+                git -C "$path" log \
+                    -15 \
+                    --date=short \
+                    --format='%h %ad %s' |
+                    gum pager
+                ;;
+
+            "$discard")
+                warning "Removing this deletes $path and permanently discards"
+                warning "everything listed above. It is not in the reflog."
+                echo
+
+                if ! confirm_with_details \
+                    "Discard $summary in '$branch'?" \
+                    "$discard" \
+                    "$changes"
+                then
+                    info "Kept '$branch'."
+                    continue
                 fi
-            fi
-            ;;
-    esac
+
+                local typed
+                typed="$(prompt_for_line "$typed_prompt")"
+
+                if [[ "$typed" != "DELETE" ]]; then
+                    info "Confirmation did not match; kept '$branch'."
+                    pause
+                    continue
+                fi
+
+                if [[ "$state" == "LOCKED" ]]; then
+                    git worktree unlock "$path" || true
+                fi
+
+                git worktree remove --force "$path"
+                git worktree prune
+                refresh_worktree_list
+                mark_state_stale
+                success "Removed worktree: $branch"
+
+                return 0
+                ;;
+
+            "Stop reviewing the rest")
+                return 1
+                ;;
+
+            *)
+                # "Keep", and a cancelled menu, which must never mean anything else.
+                return 0
+                ;;
+        esac
+    done
 }
 
 #
@@ -2248,26 +2639,43 @@ remove_blocking_worktree() {
 
     state="$(worktree_state "$path")"
 
+    local changes="$TMP_ROOT/blocking-changes.txt"
+    local summary
+    local count
+
+    summary="$(describe_changes "$path" "$changes")"
+    count=$(count_rows "$changes")
+
     echo
     echo "${BOLD}$branch${RESET}"
     echo "  Worktree: $path"
-    echo "  State:    $state"
+    echo "  State:    $state — $summary"
     echo
 
-    if [[ "$state" == "DIRTY" ]]; then
-        git -C "$path" status --short --ignore-submodules=none || true
+    if [[ "$count" -gt 0 ]]; then
+        preview_file "$changes" "$PREVIEW_LIMIT" "  "
         echo
-        warning "Removing this worktree permanently discards those changes."
+        warning "Removing this worktree permanently discards those $count change(s)."
+        echo
     fi
 
-    if ! confirm "Remove the worktree and free '$branch'?"; then
+    #
+    # The details behind the question are the changes themselves when there are
+    # any: this is the prompt inside a bulk deletion, so the branch it names is
+    # the only thing telling the user which of twenty they are answering for.
+    #
+    if ! confirm_with_details \
+        "Remove the worktree of '$branch' ($summary)?" \
+        "Remove the worktree and free '$branch'" \
+        "$changes"
+    then
         info "Keeping '$branch'."
         return 1
     fi
 
-    if [[ "$state" == "DIRTY" ]]; then
+    if [[ "$count" -gt 0 ]]; then
         local typed
-        typed="$(prompt_for_line "Type DELETE to discard the changes: ")"
+        typed="$(prompt_for_line "Type DELETE to discard $count change(s) in '$branch': ")"
 
         if [[ "$typed" != "DELETE" ]]; then
             info "Confirmation did not match; keeping '$branch'."
@@ -2427,6 +2835,45 @@ write_evidence_table() {
 }
 
 #
+# One readable line per branch — class, age, name, and the evidence in short form
+# — for the previews on the plan screen and the pager behind them.
+#
+write_branch_rows() {
+    local ids="$1"
+    local out="$2"
+
+    : > "$out"
+
+    local id
+    local pr
+    local note
+
+    load_ids "$ids"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+        pr="$(branch_field "$id" 9)"
+        note=""
+
+        [[ "$(branch_field "$id" 6)" == "true" ]] && note="remote gone"
+
+        case "$pr" in
+            merged | open | closed)
+                note="${note:+$note, }PR $pr"
+                ;;
+        esac
+
+        [[ -n "$(branch_worktree_path "$(branch_field "$id" 2)")" ]] &&
+            note="${note:+$note, }in a worktree"
+
+        printf '%-14s %4sd  %-38s %s\n' \
+            "$(classify_branch "$id")" \
+            "$(branch_field "$id" 4)" \
+            "$(branch_field "$id" 2)" \
+            "$note" >> "$out"
+    done
+}
+
+#
 # One action for the whole selection.
 #
 # Asking the user to pick a deletion strategy up front was the reason a run could
@@ -2443,6 +2890,12 @@ delete_selected_branches() {
     local unknown="$TMP_ROOT/plan-unknown.txt"
     local kept="$TMP_ROOT/plan-kept.txt"
     local report="$TMP_ROOT/plan-evidence.txt"
+
+    local proven_rows="$TMP_ROOT/plan-rows-proven.txt"
+    local abandoned_rows="$TMP_ROOT/plan-rows-abandoned.txt"
+    local unknown_rows="$TMP_ROOT/plan-rows-unknown.txt"
+    local kept_rows="$TMP_ROOT/plan-rows-kept.txt"
+    local clearing_rows="$TMP_ROOT/plan-rows-clearing.txt"
 
     : > "$proven"
     : > "$abandoned"
@@ -2482,6 +2935,13 @@ delete_selected_branches() {
 
     local clearing=$((proven_count + abandoned_count))
 
+    write_branch_rows "$(cat "$proven")" "$proven_rows"
+    write_branch_rows "$(cat "$abandoned")" "$abandoned_rows"
+    write_branch_rows "$(cat "$unknown")" "$unknown_rows"
+    write_branch_rows "$(cat "$kept")" "$kept_rows"
+
+    cat "$proven_rows" "$abandoned_rows" > "$clearing_rows"
+
     clear
     title "Deletion Plan"
 
@@ -2489,24 +2949,28 @@ delete_selected_branches() {
         echo "  ${GREEN}$proven_count${RESET} merged"
         echo "      already on $BASE_REF: by ancestry, by patch after a squash"
         echo "      merge, or by a merged pull request"
+        preview_file "$proven_rows" "$PREVIEW_LIMIT" "      "
         echo
     fi
 
     if [[ "$abandoned_count" -gt 0 ]]; then
         echo "  ${GREEN}$abandoned_count${RESET} abandoned"
         echo "      the remote branch was deleted and no pull request is open"
+        preview_file "$abandoned_rows" "$PREVIEW_LIMIT" "      "
         echo
     fi
 
     if [[ "$unknown_count" -gt 0 ]]; then
         echo "  ${YELLOW}$unknown_count${RESET} unclear"
         echo "      no signal either way; confirmed separately"
+        preview_file "$unknown_rows" "$PREVIEW_LIMIT" "      "
         echo
     fi
 
     if [[ "$kept_count" -gt 0 ]]; then
         echo "  ${CYAN}$kept_count${RESET} kept"
         echo "      protected, or checked out in the primary worktree"
+        preview_file "$kept_rows" "$PREVIEW_LIMIT" "      "
         echo
     fi
 
@@ -2531,7 +2995,11 @@ delete_selected_branches() {
         echo "each one is printed, and it stays in the reflog."
         echo
 
-        if confirm "Delete these $clearing branches?"; then
+        if confirm_with_details \
+            "Delete $clearing branch(es) whose work landed?" \
+            "Delete these $clearing branches" \
+            "$clearing_rows"
+        then
             echo
             run_confirmed_deletions "$proven" "merged"
             run_confirmed_deletions "$abandoned" "abandoned"
@@ -2581,12 +3049,21 @@ run_forced_deletions() {
     local report="$2"
 
     local count
-    count=$(wc -l < "$list" | tr -d ' ')
+    count=$(count_rows "$list")
 
     write_evidence_table "$(cat "$list")" "$report"
 
+    clear
+    title "Force delete $count branch(es)"
+
+    #
+    # Previewed rather than paged straight into the user's face: the pager used
+    # to open before the warning underneath it had been read, and it covered the
+    # screen that explains what the UNMERGED column does and does not prove. The
+    # full table is still one entry away in the question below.
+    #
+    preview_file "$report" "$((PREVIEW_LIMIT + 2))" "  "
     echo
-    gum pager < "$report"
 
     warning "Force deleting $count branch(es) skips every merge check."
     echo
@@ -2598,13 +3075,17 @@ run_forced_deletions() {
     echo "the reflog, so a branch can be restored with 'git branch <name> <hash>'."
     echo
 
-    if ! confirm "Force delete these $count branches?"; then
+    if ! confirm_with_details \
+        "Force delete $count branch(es) with no evidence either way?" \
+        "Force delete these $count branches" \
+        "$report"
+    then
         info "Kept all $count."
         return
     fi
 
     local typed
-    typed="$(prompt_for_line "Type DELETE to confirm: ")"
+    typed="$(prompt_for_line "Type DELETE to force delete $count branch(es): ")"
 
     if [[ "$typed" != "DELETE" ]]; then
         warning "Confirmation did not match; kept all $count."
@@ -2624,84 +3105,151 @@ run_forced_deletions() {
     done
 }
 
+#
+# One branch, with the evidence on screen next to the actions it allows.
+#
+# This used to open the commit log in a pager before asking anything, so the
+# review began with a full screen that said nothing about why the branch was in
+# the list, and the question that followed it — "What should happen?" — named
+# neither the branch nor which of the selected ones it was. The log is now one
+# entry away, and the screen behind every prompt says what is at stake.
+#
+# Returning 1 ends the review of the remaining branches.
+#
 review_branch_individually() {
     local id="$1"
+    local index="${2:-}"
+    local total="${3:-}"
 
     local branch
     local worktree
     local pr
     local gone
+    local class
+    local subject
+    local unmerged
 
     branch="$(branch_field "$id" 2)"
     pr="$(branch_field "$id" 9)"
     gone="$(branch_field "$id" 6)"
+    class="$(classify_branch "$id")"
 
-    refresh_worktree_list
-    worktree="$(branch_worktree_path "$branch")"
+    subject="$(subject_with_position "$branch" "$index" "$total")"
 
-    clear
-    title "$branch"
+    local log_file="$TMP_ROOT/branch-log.txt"
+    local action
 
-    git log \
-        "$branch" \
-        -15 \
-        --date=short \
-        --format='%h %ad %s' |
-        gum pager
+    while true; do
+        refresh_worktree_list
+        worktree="$(branch_worktree_path "$branch")"
+        unmerged="$(commits_not_on_base "$branch")"
 
-    if [[ -n "$worktree" ]]; then
-        warning "This branch is checked out in $worktree."
+        clear
+        title "$subject"
+
+        local upstream
+        upstream="$(branch_field "$id" 5)"
+
+        echo "Branch:       $branch"
+        echo "Last commit:  $(branch_field "$id" 3) ($(branch_field "$id" 4) days ago)"
+        echo "Evidence:     ${class%%:*} — $(describe_evidence "${class%%:*}")"
+        echo "Upstream:     ${upstream:-none}$([[ "$gone" == "true" ]] && echo " (gone)")"
+        echo "Pull request: $(describe_pr_state "$pr")"
+        echo "Unmerged:     $unmerged commit(s) not on $BASE_REF"
+
+        if [[ -n "$worktree" ]]; then
+            echo "Worktree:     $worktree"
+        fi
+
         echo
 
-        if ! remove_blocking_worktree "$branch"; then
-            pause
-            return
-        fi
-    fi
+        git log "$branch" -10 --date=short --format='%h %ad %s' > "$log_file" 2>/dev/null || : > "$log_file"
+        preview_file "$log_file" "$PREVIEW_LIMIT"
+        echo
 
-    local action
-    action="$(
-        menu \
-            "What should happen?" \
-            "Try safe delete" \
-            "Force delete local branch" \
-            "Keep" \
-            "Back"
-    )"
+        action="$(
+            menu \
+                "$subject — ${class%%:*}, $unmerged commit(s) not on $BASE_REF. What should happen?" \
+                "Keep '$branch' and move on" \
+                "Show the full history of '$branch'" \
+                "Try safe delete of '$branch'" \
+                "Force delete '$branch'" \
+                "Stop reviewing the rest"
+        )"
 
-    case "$action" in
-        "Try safe delete")
-            local output
+        case "$action" in
+            "Show the full history of "*)
+                git log "$branch" -200 --date=short --format='%h %ad %s' | gum pager
+                ;;
 
-            if output="$(git branch -d "$branch" 2>&1)"; then
-                success "Deleted branch."
-                mark_state_stale
-            else
+            "Try safe delete of "*)
+                if [[ -n "$worktree" ]] && ! remove_blocking_worktree "$branch"; then
+                    pause
+                    continue
+                fi
+
+                local output
+
+                if output="$(git branch -d "$branch" 2>&1)"; then
+                    success "Deleted branch: $branch"
+                    mark_state_stale
+                    return 0
+                fi
+
                 report_git_refusal "$branch" "$output"
                 pause
-            fi
-            ;;
+                ;;
 
-        "Force delete local branch")
-            warning "This may delete the only remaining copy of unmerged work."
-
-            if [[ "$pr" == "merged" ]]; then
-                info "GitHub reports that this branch's PR was merged."
-            elif [[ "$gone" == "true" ]]; then
-                warning "The remote branch is gone, but that does NOT prove it was merged."
-            fi
-
-            if confirm "Force delete '$branch'?"; then
-                local typed
-
-                typed="$(prompt_for_line "Type DELETE to confirm: ")"
-
-                if [[ "$typed" == "DELETE" ]]; then
-                    force_delete_branch "$branch"
+            "Force delete '$branch'")
+                if [[ -n "$worktree" ]] && ! remove_blocking_worktree "$branch"; then
+                    pause
+                    continue
                 fi
-            fi
-            ;;
-    esac
+
+                warning "This may delete the only remaining copy of $unmerged commit(s)."
+
+                if [[ "$pr" == "merged" ]]; then
+                    info "GitHub reports that this branch's pull request was merged."
+                elif [[ "$gone" == "true" ]]; then
+                    warning "The remote branch is gone, but that does NOT prove it was merged."
+                fi
+
+                echo
+
+                if ! confirm_with_details \
+                    "Force delete '$branch' with $unmerged commit(s) not on $BASE_REF?" \
+                    "Force delete '$branch'" \
+                    "$log_file"
+                then
+                    info "Kept '$branch'."
+                    continue
+                fi
+
+                local typed
+                typed="$(prompt_for_line "Type DELETE to force delete '$branch': ")"
+
+                if [[ "$typed" != "DELETE" ]]; then
+                    info "Confirmation did not match; kept '$branch'."
+                    pause
+                    continue
+                fi
+
+                force_delete_branch "$branch"
+                pause
+
+                return 0
+                ;;
+
+            "Stop reviewing the rest")
+                return 1
+                ;;
+
+            *)
+                # "Keep", and a cancelled menu, which must never mean anything else.
+                return 0
+                ;;
+        esac
+    done
 }
 
 #
@@ -2749,11 +3297,17 @@ branch_menu() {
 
             "Review selected individually")
                 local branch_id
+                local review_index=0
+                local review_total
 
                 load_ids "$ids"
+                review_total="$(selected_count)"
 
                 for branch_id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
-                    review_branch_individually "$branch_id"
+                    review_index=$((review_index + 1))
+
+                    review_branch_individually \
+                        "$branch_id" "$review_index" "$review_total" || break
                 done
                 ;;
         esac

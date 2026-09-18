@@ -13,6 +13,12 @@ Bug reports and small, focused pull requests are welcome.
 - The safety rules in the README are the contract. A change that can delete a dirty
   worktree, a checked-out branch, or an unmerged branch without an explicit confirmation
   will not be merged.
+- Every prompt names what it acts on, and every list it shows can be read to the end. A
+  header that says "this worktree", a `git status` printed straight to the terminal, or a
+  typed `DELETE` that does not repeat what is about to be destroyed will not be merged:
+  `tests/disclosure-test.sh` fails on all three. Use `subject_with_position`,
+  `describe_changes`, `preview_file` and `confirm_with_details` rather than `confirm` for
+  anything destructive.
 - No new runtime dependencies beyond `git`, `gum` and `gh`. `gh` is optional and must stay
   that way: a rung of the evidence ladder that only a forge can answer may refine a
   classification, never be the only thing that produces one.

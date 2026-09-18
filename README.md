@@ -97,10 +97,56 @@ git config cleanup-assistant.protected '^(main|release/.*|integration)$'
 
 `GIT_CLEANUP_ASSISTANT_PROTECTED` overrides that for a single run.
 
+## You always know what you are acting on
+
+A cleanup tool that cannot say *which* worktree it is about to empty is a worse tool than
+no cleanup tool. Three rules therefore hold at every prompt, and there are tests that fail
+when one of them is broken:
+
+- **The header names its subject.** Not "What should happen to this worktree?" but
+  `fix/NA-1164/fehlerkatalog (3 of 7) — 402 changes: 400 deleted, 2 untracked. What should
+  happen?` A review that stops seven times says which stop this is.
+- **A list is previewed, never dumped.** The first lines are shown, the rest is counted,
+  and the preview shrinks to whatever the terminal can hold — a bounded list that does not
+  fit would still push the subject off the top of the screen, which is the failure this
+  replaces.
+- **The full list is one entry away.** Every group confirmation offers `Show all 402 first`
+  and re-asks the question when the pager closes, so nothing has to be answered from a
+  count alone.
+
+A screen before an irreversible step therefore looks like this:
+
+```
+════════════════════════════════════════════════════════════
+fix/NA-1164/fehlerkatalog (3 of 7)
+════════════════════════════════════════════════════════════
+Worktree:    ~/worktrees/voffice/fehlerkatalog
+Branch:      fix/NA-1164/fehlerkatalog
+Last commit: 2026-09-11 (7 days ago)
+Evidence:    PROVEN — the branch is already on main
+State:       DIRTY — 402 changes: 400 deleted, 2 untracked
+
+     D Vo.Tests.Disposition.Integration/Tours/TourCheckerTests.cs
+     D Vo.Tests.Disposition.Integration/Tours/TourGeneratorTests.cs
+    … and 400 more
+
+  fix/NA-1164/fehlerkatalog (3 of 7) — 402 changes: 400 deleted, 2 untracked.
+  What should happen?
+    Keep this worktree and move on
+    Show all 402 changes
+    Show recent commits
+    Remove worktree and DISCARD 402 change(s)
+    Stop reviewing the rest
+```
+
+The same applies to the plans: every group names its members instead of only counting
+them, so `Remove these 12 worktrees` is answered with the twelve names on screen.
+
 ## Safety rules
 
 The whole point is that a bulk delete stays boring. These rules are enforced in code:
 
+- Every prompt names what it acts on, and every list it shows can be read to the end
 - The primary worktree and its branch are never removed
 - A protected branch is never deleted, and neither is the worktree that holds it
 - Dirty worktrees are never bulk deleted; removing one needs a typed `DELETE` confirmation
@@ -120,6 +166,9 @@ The whole point is that a bulk delete stays boring. These rules are enforced in 
 - Every refusal and every skipped branch is reported with Git's own reason, so a run that
   deletes nothing says why
 - Deleting an *unclear* branch needs a typed `DELETE` on top of the plan's confirmation
+- A typed confirmation repeats what it destroys: `Type DELETE to discard 402 change(s) in
+  'fix/NA-1164/fehlerkatalog':`, never a bare `Type DELETE to confirm:`
+- A cancelled prompt always means *no*, including the `Esc` that closes a menu
 
 ## Does it need GitHub?
 
@@ -242,6 +291,14 @@ They cover the logic, not the terminal. The interactive flow was verified separa
 driving a real run through a pseudo terminal against a scratch repository — which is how two
 failures were found that no unit test would have reached: `gum input` panicking on an empty
 field, and an unresolvable base ref silently reporting every branch as unclear.
+
+What a screen says is testable, though, and `tests/disclosure-test.sh` tests it: the
+change summaries, the bounded previews and their fit to the terminal, the subject and its
+position, and a confirmation that offers the full list and treats a cancelled menu as a
+no. Four of its cases are structural — they grep the script for the anonymous prompts that
+used to be there (`What should happen to this worktree?`, `Type DELETE to confirm`, an
+unbounded `status --short`) so that reintroducing one fails here rather than in front of
+someone with four hundred changed files on screen.
 
 ## Requirements
 
