@@ -12,6 +12,7 @@
 #   - Staleness information based on the latest commit
 #   - Cached GitHub API data for large repositories
 #   - Automatic dependency setup on macOS via Homebrew
+#   - Unattended --plan and --apply-merged for timers, without gum or prompts
 #
 # Safety principles:
 #   - The primary worktree and its branch are never removed
@@ -52,6 +53,29 @@ UPDATE_FORMULA="CodingSteve01/tap/git-cleanup-assistant"
 UPDATE_CHECK_INTERVAL_SECONDS=86400
 UPDATE_STATE_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/git-cleanup-assistant/last-update-check"
 
+#
+# Set by parse_arguments. The interactive session is the default; --plan and
+# --apply-merged run without gum, without a prompt and without an update check.
+#
+MODE="interactive"
+NONINTERACTIVE=false
+DELETE_BRANCHES=false
+CLI_BASE_REF=""
+CLI_MIN_IDLE_DAYS=""
+
+#
+# How many days a merged worktree has to sit untouched before --apply-merged
+# removes it. See split_recent_worktrees.
+#
+DEFAULT_MIN_IDLE_DAYS=7
+MIN_IDLE_DAYS="$DEFAULT_MIN_IDLE_DAYS"
+
+#
+# Paths whose changes do not make a worktree dirty, one per line. Empty unless
+# configured; see resolve_ignore_dirty_paths.
+#
+IGNORE_DIRTY_PATHS=""
+
 # -----------------------------------------------------------------------------
 # Temporary workspace
 # -----------------------------------------------------------------------------
@@ -72,6 +96,7 @@ PR_CACHE="$TMP_ROOT/pr-cache.tsv"
 PR_QUERY="$TMP_ROOT/pr-query.graphql"
 PR_RESPONSE="$TMP_ROOT/pr-response.json"
 PR_HEADS="$TMP_ROOT/pr-heads.txt"
+PR_COMMIT_CACHE="$TMP_ROOT/pr-commit-cache.tsv"
 
 # -----------------------------------------------------------------------------
 # Formatting
@@ -734,6 +759,72 @@ resolve_protected_pattern() {
     PROTECTED_PATTERN="$DEFAULT_PROTECTED_PATTERN"
 }
 
+#
+# Paths whose changes do not count as uncommitted work, read the same way the
+# protected pattern is: the environment wins over `git config`, and nothing is
+# ignored unless one of them says so.
+#
+# The case this exists for is a submodule whose pointer a test run moves in every
+# worktree it touches. Without it, every worktree that ever ran those tests reads
+# as dirty and is never removed, whatever its branch says. Values are separated
+# by commas or spaces, and `git config --add` can repeat the key.
+#
+resolve_ignore_dirty_paths() {
+    local raw
+
+    if [[ -n "${GIT_CLEANUP_ASSISTANT_IGNORE_DIRTY:-}" ]]; then
+        raw="$GIT_CLEANUP_ASSISTANT_IGNORE_DIRTY"
+    else
+        raw="$(git config --get-all cleanup-assistant.ignore-dirty 2>/dev/null || true)"
+    fi
+
+    IGNORE_DIRTY_PATHS="$(
+        printf '%s\n' "$raw" |
+            awk '{ gsub(/[, ]+/, "\n"); print }' |
+            sed -e 's#^\./##' -e 's#/*$##' |
+            awk 'NF && !seen[$0]++'
+    )"
+}
+
+#
+# Drops the porcelain status lines whose path is an ignored one or lies below it,
+# so what is left is the work that decides whether a worktree is dirty.
+#
+filter_ignored_changes() {
+    if [[ -z "$IGNORE_DIRTY_PATHS" ]]; then
+        cat
+        return
+    fi
+
+    # Joined by commas for awk, whose -v does not carry a newline portably.
+    awk -v ignored="$(printf '%s' "$IGNORE_DIRTY_PATHS" | tr '\n' ',')" '
+        BEGIN {
+            count = split(ignored, paths, ",")
+        }
+
+        {
+            path = substr($0, 4)
+
+            # A rename reads "old -> new"; the new path is the one that exists.
+            arrow = index(path, " -> ")
+            if (arrow > 0) {
+                path = substr(path, arrow + 4)
+            }
+
+            gsub(/^"|"$/, "", path)
+            sub(/\/$/, "", path)
+
+            for (i = 1; i <= count; i++) {
+                if (path == paths[i] || index(path, paths[i] "/") == 1) {
+                    next
+                }
+            }
+
+            print
+        }
+    '
+}
+
 branch_is_protected() {
     local branch="$1"
 
@@ -821,6 +912,7 @@ initialize_repository() {
     REPO_ROOT="$(git rev-parse --show-toplevel)"
 
     resolve_protected_pattern
+    resolve_ignore_dirty_paths
 
     # So the shared lookups have a file to read before the first scan runs.
     refresh_worktree_list
@@ -1008,7 +1100,7 @@ refresh_pr_cache() {
         # mean anything and gum spin cannot call a shell function. A batch is
         # one request, so the line moves at the speed of the work behind it.
         #
-        if [[ "$total" -gt "$PR_QUERY_BATCH_SIZE" ]]; then
+        if [[ "$total" -gt "$PR_QUERY_BATCH_SIZE" && "$NONINTERACTIVE" != true ]]; then
             printf '\r  Reading pull request state: %s-%s of %s' \
                 "$first" "$last" "$total"
         fi
@@ -1018,7 +1110,8 @@ refresh_pr_cache() {
         first=$((last + 1))
     done
 
-    [[ "$total" -gt "$PR_QUERY_BATCH_SIZE" ]] && printf '\r%*s\r' 60 ""
+    [[ "$total" -gt "$PR_QUERY_BATCH_SIZE" && "$NONINTERACTIVE" != true ]] &&
+        printf '\r%*s\r' 60 ""
 
     if [[ "$failed" -gt 0 ]]; then
         warning "$failed pull request request(s) failed; classification falls back to git."
@@ -1093,7 +1186,8 @@ worktree_is_dirty() {
     [[ -n "$(
         git -C "$target" \
             status --porcelain --ignore-submodules=none \
-            2>/dev/null
+            2>/dev/null |
+            filter_ignored_changes
     )" ]]
 }
 
@@ -1196,7 +1290,8 @@ probe_one_dirty_state() {
     local out="$2"
 
     if [[ -n "$(
-        git -C "$path" status --porcelain --ignore-submodules=none 2>/dev/null
+        git -C "$path" status --porcelain --ignore-submodules=none 2>/dev/null |
+            filter_ignored_changes
     )" ]]; then
         printf '%s\tDIRTY\n' "$path" > "$out"
     else
@@ -1217,9 +1312,9 @@ dirty_state_of() {
 }
 
 #
-# Turns the porcelain worktree list into one record per worktree: path, branch
-# and whether git holds it locked. All three are in the list already, so no git
-# process is needed per worktree to read them.
+# Turns the porcelain worktree list into one record per worktree: path, branch,
+# whether git holds it locked, and the commit it has checked out. All four are in
+# the list already, so no git process is needed per worktree to read them.
 #
 parse_worktree_list() {
     local out="$1"
@@ -1227,17 +1322,23 @@ parse_worktree_list() {
     awk -v primary="$PRIMARY_WORKTREE" '
         function flush() {
             if (path != "" && path != primary) {
-                printf "%s\t%s\t%s\n", path, (branch == "" ? "(detached)" : branch), locked
+                printf "%s\t%s\t%s\t%s\n", path, (branch == "" ? "(detached)" : branch), locked, head
             }
 
             path = ""
             branch = ""
             locked = "false"
+            head = ""
         }
 
         /^worktree / {
             flush()
             path = substr($0, 10)
+            next
+        }
+
+        /^HEAD / {
+            head = substr($0, 6)
             next
         }
 
@@ -1256,6 +1357,69 @@ parse_worktree_list() {
             flush()
         }
     ' "$WORKTREE_LIST" > "$out"
+}
+
+#
+# The merge evidence for a detached HEAD, from git alone: "ancestry" when the
+# commit is on the base ref, "patch" when its change is, empty when neither.
+#
+# Detached worktrees are common where tooling checks out a commit rather than a
+# branch, and every one of them used to read as unclear because the ladder only
+# looked a branch up by name. The commit answers the same two questions.
+#
+detached_merge_evidence() {
+    local head="$1"
+
+    if branch_is_merged_into_base "$head"; then
+        echo "ancestry"
+    elif branch_is_patch_equivalent_to_base "$head"; then
+        echo "patch"
+    fi
+}
+
+#
+# Asks GitHub which pull request a commit belongs to: "state<TAB>number<TAB>url",
+# "none" when there is none, "unknown" when GitHub was not asked. A merged pull
+# request wins over a newer open or closed one, for the reason query_pr_batch
+# gives. Answers are cached per commit for the run.
+#
+pr_info_for_commit() {
+    local sha="$1"
+    local answer
+
+    if [[ "$GH_AVAILABLE" != true || -z "$REPO_SLUG" ]]; then
+        printf 'unknown\t\t'
+        return
+    fi
+
+    answer="$(
+        awk -F '\t' -v sha="$sha" '$1 == sha { print $2 "\t" $3 "\t" $4; exit }' \
+            "$PR_COMMIT_CACHE" 2>/dev/null
+    )"
+
+    if [[ -z "$answer" ]]; then
+        # $pr is a jq binding, not a shell variable.
+        # shellcheck disable=SC2016
+        answer="$(
+            gh api "repos/$REPO_SLUG/commits/$sha/pulls" --jq '
+                ((map(select(.merged_at != null)) | first) // .[0]) as $pr
+                | if $pr == null then "none\t\t"
+                  else [
+                      (if $pr.merged_at != null then "merged" else $pr.state end),
+                      ($pr.number | tostring),
+                      $pr.html_url
+                  ] | @tsv
+                  end
+            ' 2>/dev/null | head -1
+        )"
+
+        # A commit GitHub has never seen is a 422, which answers "none" too.
+        [[ -z "$answer" ]] && answer="$(printf 'none\t\t')"
+
+        printf '%s\t%s\n' "$sha" "$answer" >> "$PR_COMMIT_CACHE"
+    fi
+
+    printf '%s' "$answer"
 }
 
 scan_worktrees() {
@@ -1288,8 +1452,10 @@ scan_worktrees() {
     local pr_number
     local pr_url
     local pr_info
+    local head
+    local detached_evidence
 
-    while IFS=$'\t' read -r path branch locked; do
+    while IFS=$'\t' read -r path branch locked head; do
         [[ -z "$path" ]] && continue
         [[ ! -d "$path" ]] && continue
 
@@ -1298,6 +1464,7 @@ scan_worktrees() {
         date="unknown"
         epoch="0"
         gone=false
+        detached_evidence=""
 
         if [[ "$branch" != "(detached)" ]]; then
             date="$(ref_metadata_field "$branch" 2)"
@@ -1310,6 +1477,14 @@ scan_worktrees() {
             if [[ "$track" == *"[gone]"* ]]; then
                 gone=true
             fi
+        elif [[ -n "$head" ]]; then
+            date="$(git log -1 --format=%cs "$head" 2>/dev/null || true)"
+            epoch="$(git log -1 --format=%ct "$head" 2>/dev/null || true)"
+
+            [[ -z "$date" ]] && date="unknown"
+            [[ -z "$epoch" ]] && epoch="0"
+
+            detached_evidence="$(detached_merge_evidence "$head")"
         fi
 
         age="$(age_in_days "$epoch")"
@@ -1332,9 +1507,20 @@ scan_worktrees() {
             IFS=$'\t' read -r pr_state pr_number pr_url <<EOF
 $pr_info
 EOF
+        elif [[ -n "$head" && -z "$detached_evidence" ]]; then
+            #
+            # A detached worktree has no branch name to look a pull request up
+            # by, so the commit is asked instead. Only when git found nothing:
+            # the forge refines the ladder, it is never asked first.
+            #
+            pr_info="$(pr_info_for_commit "$head")"
+
+            IFS=$'\t' read -r pr_state pr_number pr_url <<EOF
+$pr_info
+EOF
         fi
 
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "W$(printf '%05d' "$index")" \
             "$path" \
             "$branch" \
@@ -1346,6 +1532,8 @@ EOF
             "$pr_number" \
             "$pr_url" \
             "$epoch" \
+            "$head" \
+            "$detached_evidence" \
             >> "$WORKTREE_DATA"
     done < "$records"
 
@@ -1557,17 +1745,24 @@ refresh_repository_state_if_stale() {
     refresh_repository_state
 }
 
+#
+# Progress is drawn with carriage returns for a terminal. A non-interactive run
+# writes to a log, where every one of those redraws would be a line of noise.
+#
 show_scan_progress() {
     local label="$1"
     local done_count="$2"
     local total="$3"
 
+    [[ "$NONINTERACTIVE" == true ]] && return 0
     [[ "$total" -gt 0 ]] || return 0
 
     printf '\r  %s %s/%s' "$label" "$done_count" "$total"
 }
 
 clear_scan_progress() {
+    [[ "$NONINTERACTIVE" == true ]] && return 0
+
     printf '\r%*s\r' 60 ""
 }
 
@@ -1620,7 +1815,7 @@ count_worktree_class() {
         {
             if (protected_branch[$3] == 1)
                 class = "PROTECTED"
-            else if ($8 == "merged" || merged_branch[$3] == 1)
+            else if ($8 == "merged" || merged_branch[$3] == 1 || $13 != "")
                 class = "MERGED"
             else if ($7 == "true" && $8 != "open")
                 class = "ABANDONED"
@@ -1798,7 +1993,8 @@ classify_worktree() {
 
     if [[ "$pr" == "merged" ||
         "$git_merged" == "true" ||
-        "$squash_merged" == "true" ]]
+        "$squash_merged" == "true" ||
+        -n "$(worktree_field "$id" 13)" ]]
     then
         class="PROVEN"
     elif [[ "$gone" == "true" && "$pr" != "open" ]]; then
@@ -1867,7 +2063,7 @@ worktree_display_rows() {
 
             if (protected_branch[branch] == 1)
                 class = "PROTECTED"
-            else if (pr == "merged" || merged_branch[branch] == 1)
+            else if (pr == "merged" || merged_branch[branch] == 1 || $13 != "")
                 class = "MERGED"
             else if (gone == "true" && pr != "open")
                 class = "ABANDONED"
@@ -2043,49 +2239,51 @@ write_worktree_rows() {
     : > "$out"
 
     local id
+    local branch
 
     load_ids "$ids"
 
     for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+        branch="$(worktree_field "$id" 3)"
+
+        # A detached worktree is named by its commit, the only name it has.
+        if [[ "$branch" == "(detached)" ]]; then
+            branch="(detached $(git rev-parse --short "$(worktree_field "$id" 12)" 2>/dev/null))"
+        fi
+
         printf '%-14s %4sd  %-38s %s\n' \
             "$(classify_worktree "$id")" \
             "$(worktree_field "$id" 5)" \
-            "$(worktree_field "$id" 3)" \
+            "$branch" \
             "$(short_path "$(worktree_field "$id" 2)")" >> "$out"
     done
 }
 
 #
-# One action for a whole worktree selection, with the same shape as the branch
-# plan: sort by evidence, show what will happen, ask once for everything the
-# ladder cleared, and hold back what needs a decision.
+# The groups of a worktree plan, as id lists and as readable rows. Shared by the
+# interactive plan and by --plan and --apply-merged, so the three cannot sort the
+# same worktree into different groups.
 #
-# The old flow asked which of four overlapping modes to enter, then which of
-# three actions to run inside it, and quietly dropped whatever the chosen action
-# did not cover. Nothing in that sequence was a question the user had the
-# information to answer.
-#
-plan_worktree_removals() {
+WT_PLAN_PROVEN="$TMP_ROOT/wt-plan-proven.txt"
+WT_PLAN_ABANDONED="$TMP_ROOT/wt-plan-abandoned.txt"
+WT_PLAN_UNKNOWN="$TMP_ROOT/wt-plan-unknown.txt"
+WT_PLAN_HELD="$TMP_ROOT/wt-plan-held.txt"
+WT_PLAN_KEPT="$TMP_ROOT/wt-plan-kept.txt"
+
+WT_ROWS_PROVEN="$TMP_ROOT/wt-rows-proven.txt"
+WT_ROWS_ABANDONED="$TMP_ROOT/wt-rows-abandoned.txt"
+WT_ROWS_UNKNOWN="$TMP_ROOT/wt-rows-unknown.txt"
+WT_ROWS_HELD="$TMP_ROOT/wt-rows-held.txt"
+WT_ROWS_KEPT="$TMP_ROOT/wt-rows-kept.txt"
+
+sort_worktree_plan() {
     local ids="$1"
 
-    local proven="$TMP_ROOT/wt-plan-proven.txt"
-    local abandoned="$TMP_ROOT/wt-plan-abandoned.txt"
-    local unknown="$TMP_ROOT/wt-plan-unknown.txt"
-    local held="$TMP_ROOT/wt-plan-held.txt"
-    local kept="$TMP_ROOT/wt-plan-kept.txt"
-
-    local proven_rows="$TMP_ROOT/wt-rows-proven.txt"
-    local abandoned_rows="$TMP_ROOT/wt-rows-abandoned.txt"
-    local unknown_rows="$TMP_ROOT/wt-rows-unknown.txt"
-    local held_rows="$TMP_ROOT/wt-rows-held.txt"
-    local kept_rows="$TMP_ROOT/wt-rows-kept.txt"
-    local clearing_rows="$TMP_ROOT/wt-rows-clearing.txt"
-
-    : > "$proven"
-    : > "$abandoned"
-    : > "$unknown"
-    : > "$held"
-    : > "$kept"
+    : > "$WT_PLAN_PROVEN"
+    : > "$WT_PLAN_ABANDONED"
+    : > "$WT_PLAN_UNKNOWN"
+    : > "$WT_PLAN_HELD"
+    : > "$WT_PLAN_KEPT"
 
     local id
     local class
@@ -2101,77 +2299,110 @@ plan_worktree_removals() {
         # here is uncommitted work.
         #
         case "$class" in
-            PROTECTED*)       echo "$id" >> "$kept" ;;
-            *:DIRTY|*:LOCKED) echo "$id" >> "$held" ;;
-            PROVEN)           echo "$id" >> "$proven" ;;
-            ABANDONED)        echo "$id" >> "$abandoned" ;;
-            *)                echo "$id" >> "$unknown" ;;
+            PROTECTED*)       echo "$id" >> "$WT_PLAN_KEPT" ;;
+            *:DIRTY|*:LOCKED) echo "$id" >> "$WT_PLAN_HELD" ;;
+            PROVEN)           echo "$id" >> "$WT_PLAN_PROVEN" ;;
+            ABANDONED)        echo "$id" >> "$WT_PLAN_ABANDONED" ;;
+            *)                echo "$id" >> "$WT_PLAN_UNKNOWN" ;;
         esac
     done
+
+    #
+    # Written before anything is printed, because every group shows its members
+    # rather than only counting them.
+    #
+    write_worktree_rows "$(cat "$WT_PLAN_PROVEN")" "$WT_ROWS_PROVEN"
+    write_worktree_rows "$(cat "$WT_PLAN_ABANDONED")" "$WT_ROWS_ABANDONED"
+    write_worktree_rows "$(cat "$WT_PLAN_UNKNOWN")" "$WT_ROWS_UNKNOWN"
+    write_worktree_rows "$(cat "$WT_PLAN_HELD")" "$WT_ROWS_HELD"
+    write_worktree_rows "$(cat "$WT_PLAN_KEPT")" "$WT_ROWS_KEPT"
+}
+
+#
+# One group of a plan: its count, what the class means, and a bounded preview of
+# its members.
+#
+print_plan_group() {
+    local color="$1"
+    local label="$2"
+    local rows="$3"
+    shift 3
+
+    local count
+    local line
+
+    count=$(count_rows "$rows")
+
+    [[ "$count" -gt 0 ]] || return 0
+
+    echo "  ${color}$count${RESET} $label"
+
+    for line in "$@"; do
+        echo "      $line"
+    done
+
+    preview_file "$rows" "$PREVIEW_LIMIT" "      "
+    echo
+}
+
+print_worktree_plan() {
+    print_plan_group "$GREEN" "merged" "$WT_ROWS_PROVEN" \
+        "the branch is already on $BASE_REF"
+
+    print_plan_group "$GREEN" "abandoned" "$WT_ROWS_ABANDONED" \
+        "the remote branch was deleted and no pull request is open"
+
+    print_plan_group "$YELLOW" "unclear" "$WT_ROWS_UNKNOWN" \
+        "no signal either way; confirmed separately"
+
+    print_plan_group "$CYAN" "dirty or locked" "$WT_ROWS_HELD" \
+        "never removed in bulk; reviewed one at a time"
+
+    print_plan_group "$CYAN" "kept" "$WT_ROWS_KEPT" \
+        "a protected branch is checked out there"
+}
+
+#
+# One action for a whole worktree selection, with the same shape as the branch
+# plan: sort by evidence, show what will happen, ask once for everything the
+# ladder cleared, and hold back what needs a decision.
+#
+# The old flow asked which of four overlapping modes to enter, then which of
+# three actions to run inside it, and quietly dropped whatever the chosen action
+# did not cover. Nothing in that sequence was a question the user had the
+# information to answer.
+#
+plan_worktree_removals() {
+    local ids="$1"
+
+    local proven="$WT_PLAN_PROVEN"
+    local abandoned="$WT_PLAN_ABANDONED"
+    local unknown="$WT_PLAN_UNKNOWN"
+    local held="$WT_PLAN_HELD"
+
+    local unknown_rows="$WT_ROWS_UNKNOWN"
+    local clearing_rows="$TMP_ROOT/wt-rows-clearing.txt"
+
+    sort_worktree_plan "$ids"
 
     local proven_count
     local abandoned_count
     local unknown_count
     local held_count
-    local kept_count
 
     proven_count=$(count_rows "$proven")
     abandoned_count=$(count_rows "$abandoned")
     unknown_count=$(count_rows "$unknown")
     held_count=$(count_rows "$held")
-    kept_count=$(count_rows "$kept")
 
     local clearing=$((proven_count + abandoned_count))
 
-    #
-    # Written before anything is printed, because every group below shows its
-    # members rather than only counting them.
-    #
-    write_worktree_rows "$(cat "$proven")" "$proven_rows"
-    write_worktree_rows "$(cat "$abandoned")" "$abandoned_rows"
-    write_worktree_rows "$(cat "$unknown")" "$unknown_rows"
-    write_worktree_rows "$(cat "$held")" "$held_rows"
-    write_worktree_rows "$(cat "$kept")" "$kept_rows"
-
-    cat "$proven_rows" "$abandoned_rows" > "$clearing_rows"
+    cat "$WT_ROWS_PROVEN" "$WT_ROWS_ABANDONED" > "$clearing_rows"
 
     clear
     title "Worktree Removal Plan"
 
-    if [[ "$proven_count" -gt 0 ]]; then
-        echo "  ${GREEN}$proven_count${RESET} merged"
-        echo "      the branch is already on $BASE_REF"
-        preview_file "$proven_rows" "$PREVIEW_LIMIT" "      "
-        echo
-    fi
-
-    if [[ "$abandoned_count" -gt 0 ]]; then
-        echo "  ${GREEN}$abandoned_count${RESET} abandoned"
-        echo "      the remote branch was deleted and no pull request is open"
-        preview_file "$abandoned_rows" "$PREVIEW_LIMIT" "      "
-        echo
-    fi
-
-    if [[ "$unknown_count" -gt 0 ]]; then
-        echo "  ${YELLOW}$unknown_count${RESET} unclear"
-        echo "      no signal either way; confirmed separately"
-        preview_file "$unknown_rows" "$PREVIEW_LIMIT" "      "
-        echo
-    fi
-
-    if [[ "$held_count" -gt 0 ]]; then
-        echo "  ${CYAN}$held_count${RESET} dirty or locked"
-        echo "      never removed in bulk; reviewed one at a time"
-        preview_file "$held_rows" "$PREVIEW_LIMIT" "      "
-        echo
-    fi
-
-    if [[ "$kept_count" -gt 0 ]]; then
-        echo "  ${CYAN}$kept_count${RESET} kept"
-        echo "      a protected branch is checked out there"
-        preview_file "$kept_rows" "$PREVIEW_LIMIT" "      "
-        echo
-    fi
+    print_worktree_plan
 
     if [[ "$clearing" -eq 0 && "$unknown_count" -eq 0 && "$held_count" -eq 0 ]]; then
         warning "Nothing in this selection can be removed."
@@ -2891,6 +3122,78 @@ write_branch_rows() {
 }
 
 #
+# The groups of a branch plan, shared by the interactive plan and --plan for the
+# reason the worktree groups are.
+#
+BR_PLAN_PROVEN="$TMP_ROOT/plan-proven.txt"
+BR_PLAN_ABANDONED="$TMP_ROOT/plan-abandoned.txt"
+BR_PLAN_UNKNOWN="$TMP_ROOT/plan-unknown.txt"
+BR_PLAN_KEPT="$TMP_ROOT/plan-kept.txt"
+
+BR_ROWS_PROVEN="$TMP_ROOT/plan-rows-proven.txt"
+BR_ROWS_ABANDONED="$TMP_ROOT/plan-rows-abandoned.txt"
+BR_ROWS_UNKNOWN="$TMP_ROOT/plan-rows-unknown.txt"
+BR_ROWS_KEPT="$TMP_ROOT/plan-rows-kept.txt"
+
+# How many of the sorted branches a worktree still holds; set by sort_branch_plan.
+BR_PLAN_BLOCKED=0
+
+sort_branch_plan() {
+    local ids="$1"
+
+    : > "$BR_PLAN_PROVEN"
+    : > "$BR_PLAN_ABANDONED"
+    : > "$BR_PLAN_UNKNOWN"
+    : > "$BR_PLAN_KEPT"
+
+    BR_PLAN_BLOCKED=0
+
+    local id
+    local class
+
+    load_ids "$ids"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+        class="$(classify_branch "$id")"
+
+        [[ "$class" == *:WT ]] && BR_PLAN_BLOCKED=$((BR_PLAN_BLOCKED + 1))
+
+        case "${class%:WT}" in
+            PRIMARY)   echo "$id" >> "$BR_PLAN_KEPT" ;;
+            PROTECTED) echo "$id" >> "$BR_PLAN_KEPT" ;;
+            PROVEN)    echo "$id" >> "$BR_PLAN_PROVEN" ;;
+            ABANDONED) echo "$id" >> "$BR_PLAN_ABANDONED" ;;
+            UNKNOWN)   echo "$id" >> "$BR_PLAN_UNKNOWN" ;;
+        esac
+    done
+
+    write_branch_rows "$(cat "$BR_PLAN_PROVEN")" "$BR_ROWS_PROVEN"
+    write_branch_rows "$(cat "$BR_PLAN_ABANDONED")" "$BR_ROWS_ABANDONED"
+    write_branch_rows "$(cat "$BR_PLAN_UNKNOWN")" "$BR_ROWS_UNKNOWN"
+    write_branch_rows "$(cat "$BR_PLAN_KEPT")" "$BR_ROWS_KEPT"
+}
+
+print_branch_plan() {
+    print_plan_group "$GREEN" "merged" "$BR_ROWS_PROVEN" \
+        "already on $BASE_REF: by ancestry, by patch after a squash" \
+        "merge, or by a merged pull request"
+
+    print_plan_group "$GREEN" "abandoned" "$BR_ROWS_ABANDONED" \
+        "the remote branch was deleted and no pull request is open"
+
+    print_plan_group "$YELLOW" "unclear" "$BR_ROWS_UNKNOWN" \
+        "no signal either way; confirmed separately"
+
+    print_plan_group "$CYAN" "kept" "$BR_ROWS_KEPT" \
+        "protected, or checked out in the primary worktree"
+
+    if [[ "$BR_PLAN_BLOCKED" -gt 0 ]]; then
+        info "$BR_PLAN_BLOCKED of these $(plural_verb "$BR_PLAN_BLOCKED") a worktree removed first, confirmed one by one."
+        echo
+    fi
+}
+
+#
 # One action for the whole selection.
 #
 # Asking the user to pick a deletion strategy up front was the reason a run could
@@ -2902,99 +3205,30 @@ write_branch_rows() {
 delete_selected_branches() {
     local ids="$1"
 
-    local proven="$TMP_ROOT/plan-proven.txt"
-    local abandoned="$TMP_ROOT/plan-abandoned.txt"
-    local unknown="$TMP_ROOT/plan-unknown.txt"
-    local kept="$TMP_ROOT/plan-kept.txt"
+    local proven="$BR_PLAN_PROVEN"
+    local abandoned="$BR_PLAN_ABANDONED"
+    local unknown="$BR_PLAN_UNKNOWN"
     local report="$TMP_ROOT/plan-evidence.txt"
-
-    local proven_rows="$TMP_ROOT/plan-rows-proven.txt"
-    local abandoned_rows="$TMP_ROOT/plan-rows-abandoned.txt"
-    local unknown_rows="$TMP_ROOT/plan-rows-unknown.txt"
-    local kept_rows="$TMP_ROOT/plan-rows-kept.txt"
     local clearing_rows="$TMP_ROOT/plan-rows-clearing.txt"
 
-    : > "$proven"
-    : > "$abandoned"
-    : > "$unknown"
-    : > "$kept"
-
-    local blocked=0
-
-    local id
-    local class
-
-    load_ids "$ids"
-
-    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
-        class="$(classify_branch "$id")"
-
-        [[ "$class" == *:WT ]] && blocked=$((blocked + 1))
-
-        case "${class%:WT}" in
-            PRIMARY)   echo "$id" >> "$kept" ;;
-            PROTECTED) echo "$id" >> "$kept" ;;
-            PROVEN)    echo "$id" >> "$proven" ;;
-            ABANDONED) echo "$id" >> "$abandoned" ;;
-            UNKNOWN)   echo "$id" >> "$unknown" ;;
-        esac
-    done
+    sort_branch_plan "$ids"
 
     local proven_count
     local abandoned_count
     local unknown_count
-    local kept_count
 
-    proven_count=$(wc -l < "$proven" | tr -d ' ')
-    abandoned_count=$(wc -l < "$abandoned" | tr -d ' ')
-    unknown_count=$(wc -l < "$unknown" | tr -d ' ')
-    kept_count=$(wc -l < "$kept" | tr -d ' ')
+    proven_count=$(count_rows "$proven")
+    abandoned_count=$(count_rows "$abandoned")
+    unknown_count=$(count_rows "$unknown")
 
     local clearing=$((proven_count + abandoned_count))
 
-    write_branch_rows "$(cat "$proven")" "$proven_rows"
-    write_branch_rows "$(cat "$abandoned")" "$abandoned_rows"
-    write_branch_rows "$(cat "$unknown")" "$unknown_rows"
-    write_branch_rows "$(cat "$kept")" "$kept_rows"
-
-    cat "$proven_rows" "$abandoned_rows" > "$clearing_rows"
+    cat "$BR_ROWS_PROVEN" "$BR_ROWS_ABANDONED" > "$clearing_rows"
 
     clear
     title "Deletion Plan"
 
-    if [[ "$proven_count" -gt 0 ]]; then
-        echo "  ${GREEN}$proven_count${RESET} merged"
-        echo "      already on $BASE_REF: by ancestry, by patch after a squash"
-        echo "      merge, or by a merged pull request"
-        preview_file "$proven_rows" "$PREVIEW_LIMIT" "      "
-        echo
-    fi
-
-    if [[ "$abandoned_count" -gt 0 ]]; then
-        echo "  ${GREEN}$abandoned_count${RESET} abandoned"
-        echo "      the remote branch was deleted and no pull request is open"
-        preview_file "$abandoned_rows" "$PREVIEW_LIMIT" "      "
-        echo
-    fi
-
-    if [[ "$unknown_count" -gt 0 ]]; then
-        echo "  ${YELLOW}$unknown_count${RESET} unclear"
-        echo "      no signal either way; confirmed separately"
-        preview_file "$unknown_rows" "$PREVIEW_LIMIT" "      "
-        echo
-    fi
-
-    if [[ "$kept_count" -gt 0 ]]; then
-        echo "  ${CYAN}$kept_count${RESET} kept"
-        echo "      protected, or checked out in the primary worktree"
-        preview_file "$kept_rows" "$PREVIEW_LIMIT" "      "
-        echo
-    fi
-
-    if [[ "$blocked" -gt 0 ]]; then
-        info "$blocked of these $(plural_verb "$blocked") a worktree removed first, confirmed one by one."
-        echo
-    fi
+    print_branch_plan
 
     if [[ "$clearing" -eq 0 && "$unknown_count" -eq 0 ]]; then
         warning "Nothing in this selection can be deleted."
@@ -3422,6 +3656,542 @@ show_final_report() {
 }
 
 # -----------------------------------------------------------------------------
+# Non-interactive modes
+# -----------------------------------------------------------------------------
+
+#
+# --plan and --apply-merged exist for a timer on a machine nobody is looking at.
+#
+# There is nobody to ask, so nothing here asks: no gum, no prompt, no update
+# check, no fetch. Every question the interactive plan would put to the user is
+# answered "no" by rule instead, and the entry it concerned is skipped and
+# reported. What is left is the one group that needs no question at all: clean
+# worktrees whose work is provably on the base ref.
+#
+
+usage() {
+    cat <<USAGE
+Usage: git-cleanup-assistant [--plan | --apply-merged [--delete-branches]] [--base-ref REF]
+
+Without flags, starts the interactive assistant.
+
+  --plan             print the cleanup plan for worktrees and branches and change
+                     nothing
+  --apply-merged     remove clean worktrees whose branch or detached HEAD is
+                     merged into the base ref; everything else is kept and listed
+  --delete-branches  with --apply-merged: also delete local branches that are
+                     merged and no longer held by a worktree
+  --base-ref REF     measure merge state against REF instead of choosing one
+  --min-idle-days N  with --apply-merged: leave merged worktrees alone whose HEAD
+                     moved in the last N days (default $DEFAULT_MIN_IDLE_DAYS, 0 turns it off)
+  -h, --help         show this help
+  --version          print the version
+
+Neither --plan nor --apply-merged needs gum, prompts, fetches or checks for an
+update. Run 'git fetch --prune' first so the base ref is current.
+USAGE
+}
+
+usage_error() {
+    echo "git-cleanup-assistant: $1" >&2
+    echo "Run 'git-cleanup-assistant --help' for usage." >&2
+    exit 2
+}
+
+parse_arguments() {
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --plan | --apply-merged)
+                [[ "$MODE" == "interactive" || "$MODE" == "${1#--}" ]] ||
+                    usage_error "--plan and --apply-merged cannot be combined."
+                MODE="${1#--}"
+                ;;
+            --delete-branches)
+                DELETE_BRANCHES=true
+                ;;
+            --base-ref)
+                [[ "$#" -ge 2 && -n "$2" ]] || usage_error "--base-ref needs a ref."
+                CLI_BASE_REF="$2"
+                shift
+                ;;
+            --min-idle-days)
+                [[ "$#" -ge 2 && "$2" =~ ^[0-9]+$ ]] ||
+                    usage_error "--min-idle-days needs a number of days."
+                CLI_MIN_IDLE_DAYS="$2"
+                shift
+                ;;
+            --min-idle-days=*)
+                CLI_MIN_IDLE_DAYS="${1#--min-idle-days=}"
+                [[ "$CLI_MIN_IDLE_DAYS" =~ ^[0-9]+$ ]] ||
+                    usage_error "--min-idle-days needs a number of days."
+                ;;
+            --base-ref=*)
+                CLI_BASE_REF="${1#--base-ref=}"
+                [[ -n "$CLI_BASE_REF" ]] || usage_error "--base-ref needs a ref."
+                ;;
+            -h | --help)
+                MODE="help"
+                return
+                ;;
+            --version)
+                MODE="version"
+                return
+                ;;
+            *)
+                usage_error "unknown argument '$1'."
+                ;;
+        esac
+
+        shift
+    done
+
+    if [[ "$DELETE_BRANCHES" == true && "$MODE" != "apply-merged" ]]; then
+        usage_error "--delete-branches only works together with --apply-merged."
+    fi
+}
+
+#
+# The flag wins over the environment, and either one has to exist: a base ref
+# that does not resolve makes every rung of the ladder answer "no evidence",
+# and unattended there is nobody to notice that the run then removed nothing
+# for weeks. Without either, the best candidate is taken, as the interactive
+# start does when there is only one.
+#
+choose_base_ref_non_interactively() {
+    local wanted="${CLI_BASE_REF:-${GIT_CLEANUP_ASSISTANT_BASE_REF:-}}"
+
+    if [[ -n "$wanted" ]]; then
+        git rev-parse --verify --quiet "$wanted^{commit}" >/dev/null 2>&1 ||
+            die "Base ref '$wanted' does not exist here; nothing was changed."
+
+        BASE_REF="$wanted"
+        return
+    fi
+
+    BASE_REF="$(base_ref_candidates | head -1)"
+
+    [[ -n "$BASE_REF" ]] ||
+        die "No base ref found; pass --base-ref. Nothing was changed."
+}
+
+#
+# gh without a login is the same as no gh: the interactive path offers
+# 'gh auth login', which is a prompt.
+#
+detect_github_non_interactively() {
+    GH_AVAILABLE=false
+
+    command_exists gh || return 0
+
+    if GH_PROMPT_DISABLED=1 gh auth status >/dev/null 2>&1; then
+        GH_AVAILABLE=true
+    fi
+}
+
+#
+# Why a merged worktree is merged, in one phrase for the removal line.
+#
+worktree_merge_reason() {
+    local id="$1"
+
+    local branch
+    local head
+    local short
+    local pr
+    local number
+
+    branch="$(worktree_field "$id" 3)"
+    head="$(worktree_field "$id" 12)"
+    pr="$(worktree_field "$id" 8)"
+    number="$(worktree_field "$id" 9)"
+
+    if [[ "$branch" == "(detached)" ]]; then
+        short="$(git rev-parse --short "$head" 2>/dev/null || printf '%s' "$head")"
+
+        case "$(worktree_field "$id" 13)" in
+            ancestry) echo "HEAD $short is on $BASE_REF" ;;
+            patch)    echo "HEAD $short is on $BASE_REF as a squash-merged patch" ;;
+            *)        echo "pull request #$number containing $short was merged" ;;
+        esac
+
+        return
+    fi
+
+    if [[ "$(branch_data_field_by_name "$branch" 8)" == "true" ]]; then
+        echo "$branch is on $BASE_REF"
+    elif [[ "$(branch_data_field_by_name "$branch" 13)" == "true" ]]; then
+        echo "$branch is on $BASE_REF as a squash-merged patch"
+    elif [[ "$pr" == "merged" ]]; then
+        echo "pull request #$number for $branch was merged"
+    else
+        describe_evidence MERGED
+    fi
+}
+
+#
+# The command that puts a removed worktree back. The branch is left alone by a
+# worktree removal, so it is named; a detached worktree is restored from its
+# commit, which stays in the object store until git gc collects it.
+#
+worktree_restore_command() {
+    local id="$1"
+
+    local path
+    local branch
+
+    path="$(worktree_field "$id" 2)"
+    branch="$(worktree_field "$id" 3)"
+
+    if [[ "$branch" == "(detached)" ]]; then
+        printf 'git worktree add --detach %q %s' "$path" "$(worktree_field "$id" 12)"
+    else
+        printf 'git worktree add %q %q' "$path" "$branch"
+    fi
+}
+
+#
+# The flag wins over the environment, the environment over `git config`.
+#
+resolve_min_idle_days() {
+    local wanted="$CLI_MIN_IDLE_DAYS"
+
+    [[ -z "$wanted" ]] && wanted="${GIT_CLEANUP_ASSISTANT_MIN_IDLE_DAYS:-}"
+    [[ -z "$wanted" ]] &&
+        wanted="$(git config --get cleanup-assistant.min-idle-days 2>/dev/null || true)"
+
+    if [[ -z "$wanted" ]]; then
+        MIN_IDLE_DAYS="$DEFAULT_MIN_IDLE_DAYS"
+    elif [[ "$wanted" =~ ^[0-9]+$ ]]; then
+        MIN_IDLE_DAYS="$wanted"
+    else
+        die "Minimum idle days '$wanted' is not a number; nothing was changed."
+    fi
+}
+
+#
+# When the worktree's HEAD last moved: a checkout, a commit, a reset, and the
+# creation of the worktree itself. Read from its reflog, which a status call
+# does not touch; the commit date stands in when there is no reflog.
+#
+worktree_last_activity() {
+    local id="$1"
+
+    local selector
+    local epoch
+
+    selector="$(
+        git -C "$(worktree_field "$id" 2)" log -g -1 --date=unix --format=%gd HEAD \
+            2>/dev/null
+    )"
+
+    epoch="${selector##*\{}"
+    epoch="${epoch%\}}"
+
+    if ! [[ "$epoch" =~ ^[0-9]+$ ]]; then
+        epoch="$(worktree_field "$id" 11)"
+    fi
+
+    echo "${epoch:-0}"
+}
+
+#
+# Moves the merged worktrees whose HEAD moved in the last MIN_IDLE_DAYS out of
+# the group --apply-merged removes.
+#
+# A worktree created a minute ago for work that has not started yet sits on the
+# base ref, so ancestry calls it merged, and it is clean. Both are true and the
+# removal would still pull it out from under whoever just created it. Nobody is
+# there to say so on an unattended run, so a quiet period says it instead.
+#
+WT_PLAN_RECENT="$TMP_ROOT/wt-plan-recent.txt"
+WT_ROWS_RECENT="$TMP_ROOT/wt-rows-recent.txt"
+
+split_recent_worktrees() {
+    local eligible="$TMP_ROOT/wt-plan-eligible.txt"
+
+    : > "$eligible"
+    : > "$WT_PLAN_RECENT"
+
+    local id
+    local idle
+
+    load_ids "$(cat "$WT_PLAN_PROVEN")"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+        idle=$(( (NOW_EPOCH - $(worktree_last_activity "$id")) / 86400 ))
+
+        if [[ "$MIN_IDLE_DAYS" -gt 0 && "$idle" -lt "$MIN_IDLE_DAYS" ]]; then
+            echo "$id" >> "$WT_PLAN_RECENT"
+        else
+            echo "$id" >> "$eligible"
+        fi
+    done
+
+    cat "$eligible" > "$WT_PLAN_PROVEN"
+
+    write_worktree_rows "$(cat "$WT_PLAN_PROVEN")" "$WT_ROWS_PROVEN"
+    write_worktree_rows "$(cat "$WT_PLAN_RECENT")" "$WT_ROWS_RECENT"
+}
+
+print_recent_worktrees() {
+    print_plan_group "$CYAN" "merged, but used recently" "$WT_ROWS_RECENT" \
+        "HEAD moved in the last $MIN_IDLE_DAYS day(s); removed once it has been idle that long"
+}
+
+#
+# Removes the plan's "merged" group and nothing else.
+#
+# The group is already free of the primary worktree, of dirty and locked
+# worktrees and of protected branches, and each of those is checked again right
+# before the removal: the scan can be minutes old on a large repository, and a
+# test run can start in a worktree in between.
+#
+APPLY_FAILED=0
+
+apply_merged_worktrees() {
+    local total
+    local candidates
+
+    total=$(count_rows "$WORKTREE_DATA")
+    candidates=$(count_rows "$WT_PLAN_PROVEN")
+
+    title "Removing merged worktrees"
+
+    if [[ "$candidates" -eq 0 ]]; then
+        info "None of the $total worktrees is merged, clean and idle for $MIN_IDLE_DAYS day(s)."
+    fi
+
+    local removed=0
+    local skipped=0
+
+    local id
+    local path
+    local branch
+    local state
+    local output
+
+    load_ids "$(cat "$WT_PLAN_PROVEN")"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+        path="$(worktree_field "$id" 2)"
+        branch="$(worktree_field "$id" 3)"
+
+        refresh_worktree_list
+
+        if [[ "$path" == "$PRIMARY_WORKTREE" ]] || branch_is_protected "$branch"; then
+            warning "Skipped $path: the primary worktree or a protected branch."
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        state="$(worktree_state "$path")"
+
+        if [[ "$state" != "CLEAN" ]]; then
+            warning "Skipped $path: it is $state now, it was clean at the scan."
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        #
+        # --force because a worktree with a submodule, or with changes under an
+        # ignored path, is refused without it. The state check above is what
+        # decides; this only stops git from asking the question a second time.
+        #
+        if output="$(git worktree remove --force "$path" 2>&1)"; then
+            success "Removed worktree $path  ·  $(worktree_merge_reason "$id")  ·  restore: $(worktree_restore_command "$id")"
+            removed=$((removed + 1))
+        else
+            warning "Could not remove $path:"
+            printf '%s\n' "$output" | sed 's/^/    /'
+            APPLY_FAILED=$((APPLY_FAILED + 1))
+        fi
+    done
+
+    git worktree prune
+    refresh_worktree_list
+
+    echo
+    info "Removed $removed of $total worktrees; kept $((total - removed))."
+    echo
+
+    #
+    # Every kept worktree is named with its reason, so a run that removed
+    # nothing says why rather than only that.
+    #
+    print_recent_worktrees
+
+    print_plan_group "$CYAN" "dirty or locked" "$WT_ROWS_HELD" \
+        "never removed unattended, whatever the evidence says"
+
+    print_plan_group "$YELLOW" "unclear" "$WT_ROWS_UNKNOWN" \
+        "no evidence that the work landed; needs a decision"
+
+    print_plan_group "$YELLOW" "abandoned" "$WT_ROWS_ABANDONED" \
+        "the remote branch is gone, which is not proof; needs a decision"
+
+    print_plan_group "$CYAN" "kept" "$WT_ROWS_KEPT" \
+        "a protected branch is checked out there"
+
+    [[ "$skipped" -gt 0 ]] &&
+        info "$skipped merged worktree(s) changed since the scan and were skipped."
+
+    return 0
+}
+
+#
+# Deletes merged branches that no worktree holds, after the worktree pass has
+# freed the ones it could. Only with --delete-branches.
+#
+apply_merged_branches() {
+    title "Deleting merged branches"
+
+    local deleted=0
+    local held=0
+
+    local id
+    local class
+
+    load_ids "$(cat "$BR_PLAN_PROVEN")"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+        class="$(classify_branch "$id")"
+
+        # A branch a kept worktree still holds stays with it.
+        if [[ "$class" != "PROVEN" ]]; then
+            held=$((held + 1))
+            continue
+        fi
+
+        if force_delete_branch "$(branch_field "$id" 2)" "merged"; then
+            deleted=$((deleted + 1))
+        else
+            APPLY_FAILED=$((APPLY_FAILED + 1))
+        fi
+    done
+
+    echo
+    info "Deleted $deleted of $(count_rows "$BRANCH_DATA") branches."
+    echo
+
+    [[ "$held" -gt 0 ]] &&
+        info "$held merged branch(es) stay because a kept worktree holds them."
+
+    print_plan_group "$YELLOW" "unclear" "$BR_ROWS_UNKNOWN" \
+        "no evidence that the work landed; needs a decision"
+
+    print_plan_group "$YELLOW" "abandoned" "$BR_ROWS_ABANDONED" \
+        "the remote branch is gone, which is not proof; needs a decision"
+
+    print_plan_group "$CYAN" "kept" "$BR_ROWS_KEPT" \
+        "protected, or checked out in the primary worktree"
+
+    return 0
+}
+
+print_non_interactive_header() {
+    local label="$1"
+
+    title "Git Cleanup Assistant $VERSION: $label"
+
+    echo "Repository:     $REPO_ROOT"
+    echo "Primary branch: ${PRIMARY_BRANCH:-(detached)}"
+    echo "Base ref:       $BASE_REF"
+    echo "Minimum idle:   $MIN_IDLE_DAYS day(s)"
+
+    if [[ "$GH_AVAILABLE" == true && -n "$REPO_SLUG" ]]; then
+        echo "GitHub:         $REPO_SLUG"
+    else
+        echo "GitHub:         unavailable (git evidence only)"
+    fi
+
+    if [[ -n "$IGNORE_DIRTY_PATHS" ]]; then
+        echo "Ignored dirty:  $(printf '%s' "$IGNORE_DIRTY_PATHS" | tr '\n' ' ')"
+    else
+        echo "Ignored dirty:  none"
+    fi
+}
+
+run_non_interactive() {
+    NONINTERACTIVE=true
+
+    require_git_repository
+    detect_github_non_interactively
+    initialize_repository
+    choose_base_ref_non_interactively
+    resolve_min_idle_days
+
+    MENU_HEIGHT="$DEFAULT_HEIGHT"
+    LIST_HEIGHT="$DEFAULT_HEIGHT"
+    STALE_DAYS="$DEFAULT_STALE_DAYS"
+
+    #
+    # A log has no screen to fit, only a reader who should not have to wade
+    # through it. The cap stays, so a list of four hundred is still counted
+    # rather than dumped.
+    #
+    PREVIEW_LIMIT=12
+
+    if [[ "${GIT_CLEANUP_ASSISTANT_PREVIEW_LIMIT:-}" =~ ^[1-9][0-9]*$ ]]; then
+        PREVIEW_LIMIT="$GIT_CLEANUP_ASSISTANT_PREVIEW_LIMIT"
+    fi
+
+    refresh_pr_cache
+    refresh_repository_state
+
+    sort_worktree_plan "$(cut -f1 "$WORKTREE_DATA")"
+    sort_branch_plan "$(cut -f1 "$BRANCH_DATA")"
+
+    if [[ "$MODE" == "plan" ]]; then
+        print_non_interactive_header "plan"
+
+        title "Worktree Removal Plan"
+        if [[ ! -s "$WORKTREE_DATA" ]]; then
+            success "No worktrees besides the primary one."
+        fi
+        print_worktree_plan
+
+        title "Deletion Plan"
+        if [[ ! -s "$BRANCH_DATA" ]]; then
+            success "No branches besides ${PRIMARY_BRANCH:-the primary branch}."
+        fi
+        print_branch_plan
+
+        #
+        # Split only now, so the plan above is the one the interactive
+        # assistant shows, and this part says what the unattended run adds.
+        #
+        split_recent_worktrees
+
+        title "With --apply-merged"
+        print_recent_worktrees
+        info "$(count_rows "$WT_PLAN_PROVEN") of $(count_rows "$WORKTREE_DATA") worktrees would be removed (merged, clean, idle for $MIN_IDLE_DAYS day(s))."
+        info "Branches are only deleted with --delete-branches. Nothing was changed."
+        return 0
+    fi
+
+    split_recent_worktrees
+
+    print_non_interactive_header "apply merged"
+
+    apply_merged_worktrees
+
+    if [[ "$DELETE_BRANCHES" == true ]]; then
+        # The worktree pass freed branches, so they are read again.
+        refresh_repository_state
+        sort_branch_plan "$(cut -f1 "$BRANCH_DATA")"
+
+        apply_merged_branches
+    fi
+
+    if [[ "$APPLY_FAILED" -gt 0 ]]; then
+        error "$APPLY_FAILED removal(s) failed; see above."
+        return 1
+    fi
+
+    return 0
+}
+
+# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 
@@ -3433,6 +4203,23 @@ show_final_report() {
 # not testing it at all.
 #
 main() {
+    parse_arguments "$@"
+
+    case "$MODE" in
+        help)
+            usage
+            exit 0
+            ;;
+        version)
+            echo "git-cleanup-assistant $VERSION"
+            exit 0
+            ;;
+        plan | apply-merged)
+            run_non_interactive
+            exit $?
+            ;;
+    esac
+
     ensure_dependencies
     ensure_github_auth
 
