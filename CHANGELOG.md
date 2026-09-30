@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/CodingSteve01/git-cleanup-assistant/compare/v0.5.0...v0.6.0) (2026-09-30)
+
+
+### Features
+
+* add unattended --plan and --apply-merged modes ([#12](https://github.com/CodingSteve01/git-cleanup-assistant/issues/12)) ([da23e78](https://github.com/CodingSteve01/git-cleanup-assistant/commit/da23e78341d3255a49725caf87c1610cffecdb87))
+
 ## [0.5.0](https://github.com/CodingSteve01/git-cleanup-assistant/compare/v0.4.0...v0.5.0) (2026-09-18)
 
 
