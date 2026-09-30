@@ -166,12 +166,35 @@ it "documents the new flags"
 assert_contains "$OUTPUT" "--apply-merged"
 
 echo
+echo "Quiet period"
+
+#
+# Every worktree above was created a moment ago, which is the case the quiet
+# period exists for: a fresh worktree on the base ref is "merged" by ancestry and
+# clean, and removing it would pull it out from under whoever just created it.
+#
+BEFORE="$(git -C "$REPO" worktree list --porcelain)"
+
+run_assistant "$FAKEBIN" --apply-merged
+
+it "keeps merged worktrees whose HEAD moved in the last 7 days by default"
+assert_equals "$BEFORE" "$(git -C "$REPO" worktree list --porcelain)"
+
+it "names them as waiting rather than dropping them silently"
+assert_contains "$OUTPUT" "merged, but used recently"
+
+run_assistant "$FAKEBIN" --apply-merged --min-idle-days x
+
+it "rejects a quiet period that is not a number"
+assert_status 2
+
+echo
 echo "--plan"
 
 BEFORE="$(git -C "$REPO" worktree list --porcelain)"
 BRANCHES_BEFORE="$(git -C "$REPO" for-each-ref --format='%(refname)' refs/heads)"
 
-run_assistant "$FAKEBIN" --plan
+run_assistant "$FAKEBIN" --plan --min-idle-days 0
 
 it "exits 0"
 assert_status 0
@@ -206,7 +229,7 @@ assert_equals "" "$(grep releases "$GH_CALLS" 2>/dev/null || true)"
 echo
 echo "--apply-merged"
 
-run_assistant "$FAKEBIN" --apply-merged
+run_assistant "$FAKEBIN" --apply-merged --min-idle-days 0
 
 it "exits 0"
 assert_status 0
@@ -270,7 +293,7 @@ echo "Ignored dirty path"
 
 git -C "$REPO" config cleanup-assistant.ignore-dirty api-contracts
 
-run_assistant "$FAKEBIN" --apply-merged
+run_assistant "$FAKEBIN" --apply-merged --min-idle-days 0
 
 it "treats a worktree whose only change is the ignored path as clean"
 assert_removed "$WORK/wt-ignored"
@@ -307,7 +330,7 @@ EOF
 chmod +x "$GH_FAKEBIN/gh"
 : > "$GH_CALLS"
 
-run_assistant "$GH_FAKEBIN" --apply-merged
+run_assistant "$GH_FAKEBIN" --apply-merged --min-idle-days 0
 
 it "removes a detached worktree whose commit is in a merged pull request"
 assert_removed "$WORK/wt-detached-unmerged"
@@ -324,7 +347,7 @@ assert_equals "" "$(grep releases "$GH_CALLS" 2>/dev/null || true)"
 echo
 echo "--delete-branches"
 
-run_assistant "$FAKEBIN" --apply-merged --delete-branches
+run_assistant "$FAKEBIN" --apply-merged --delete-branches --min-idle-days 0
 
 branch_exists() {
     git -C "$REPO" rev-parse --verify --quiet "refs/heads/$1" >/dev/null
