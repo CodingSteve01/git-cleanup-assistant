@@ -24,6 +24,8 @@ losing work you still need.
 - Asks the forge only about the branches that exist locally, so startup does not scale with
   the repository's pull request history
 - Checks once a day whether a newer release exists and can upgrade itself via Homebrew
+- Runs unattended as well: `--plan` prints the plan and changes nothing, `--apply-merged`
+  removes only clean worktrees whose work is provably merged, for a timer or a cron job
 
 ## How deleting works
 
@@ -247,7 +249,7 @@ and only when there is more than one sensible answer. Candidates are the refs th
 exist, best first: the remote's own default branch via `origin/HEAD`, then the primary
 branch, then the usual names. Nothing else is asked before you have seen the repository.
 
-Two knobs live in the environment rather than in a prompt:
+A few knobs live in the environment rather than in a prompt:
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -255,6 +257,70 @@ Two knobs live in the environment rather than in a prompt:
 | `GIT_CLEANUP_ASSISTANT_PROTECTED` | see above | branches never offered for deletion |
 | `GIT_CLEANUP_ASSISTANT_STALE_DAYS` | `30` | the age reported on the dashboard |
 | `GIT_CLEANUP_ASSISTANT_NO_UPDATE_CHECK` | unset | set to `1` to skip the update check |
+| `GIT_CLEANUP_ASSISTANT_IGNORE_DIRTY` | unset | paths whose changes do not make a worktree dirty, see below |
+| `GIT_CLEANUP_ASSISTANT_PREVIEW_LIMIT` | `12` | lines per group in `--plan` and `--apply-merged` output |
+
+## Unattended runs
+
+Two flags run the assistant without gum, without a single prompt and without the update
+check, so it can run from a timer on a machine nobody is looking at:
+
+```sh
+git fetch --prune
+git-cleanup-assistant --plan
+git-cleanup-assistant --apply-merged --base-ref origin/main
+```
+
+| Flag | Effect |
+|---|---|
+| `--plan` | prints the plan **Clean up everything** would show, worktrees and branches, and changes nothing. Exit 0 |
+| `--apply-merged` | removes the worktrees of the plan's *merged* group and nothing else; everything it keeps is listed with the reason |
+| `--delete-branches` | with `--apply-merged` only: also deletes merged local branches that no worktree holds any more. Off by default |
+| `--base-ref REF` | measures merge state against `REF`; wins over `GIT_CLEANUP_ASSISTANT_BASE_REF`. Without either, the best candidate is taken |
+| `-h`, `--help` | usage |
+| `--version` | prints the version |
+
+`--apply-merged` removes a worktree only when all of this holds:
+
+- its branch, or its detached `HEAD`, has merge evidence: ancestry, patch equivalence after
+  a squash merge, or a merged pull request found through `gh`
+- it is clean, checked again right before the removal
+- it is not the primary worktree, not locked, and does not hold a protected branch
+
+*Unclear* and *abandoned* stay, because both need a decision and there is nobody to make
+it; so do dirty and locked worktrees. Neither mode fetches: run `git fetch --prune` first,
+or the base ref is as old as the last fetch. A base ref that does not exist stops the run
+before anything is changed.
+
+Every removal is one line with the path, the evidence and the command that brings the
+worktree back:
+
+```
+✓ Removed worktree /data/wt/login-timeout  ·  fix/login-timeout is on origin/main as a squash-merged patch  ·  restore: git worktree add /data/wt/login-timeout fix/login-timeout
+```
+
+A detached worktree is restored from its commit with `git worktree add --detach`. The
+exit code is 1 when a removal git refused, 2 for a usage error, 0 otherwise.
+
+Detached worktrees go through the same ladder. Their commit is checked for ancestry and
+patch equivalence against the base ref, and when git finds nothing, `gh` is asked which
+pull request contains that commit.
+
+### Changes that do not count
+
+Some tooling changes every worktree it runs in, for example a test run that moves a
+submodule pointer. Every such worktree then reads as dirty and is never removed. Paths
+listed here are left out of the dirty check, the path itself and everything below it:
+
+```sh
+git config cleanup-assistant.ignore-dirty api-contracts
+git config --add cleanup-assistant.ignore-dirty generated/contracts
+```
+
+Commas or spaces separate several paths in one value, and
+`GIT_CLEANUP_ASSISTANT_IGNORE_DIRTY` overrides the configuration for one run. Nothing is
+ignored unless configured. The setting applies to the interactive assistant as well, so
+both describe a worktree the same way.
 
 ## Large repositories
 
@@ -303,7 +369,8 @@ someone with four hundred changed files on screen.
 ## Requirements
 
 - Git 2.22 or newer (`git branch --show-current`)
-- [gum](https://github.com/charmbracelet/gum) for the interactive prompts
+- [gum](https://github.com/charmbracelet/gum) for the interactive prompts; `--plan` and
+  `--apply-merged` do not need it
 - [GitHub CLI](https://cli.github.com) for pull request detection, authenticated via `gh auth login`
 
 On macOS the script offers to install both through Homebrew on first run. On other systems
