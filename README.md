@@ -258,6 +258,7 @@ A few knobs live in the environment rather than in a prompt:
 | `GIT_CLEANUP_ASSISTANT_STALE_DAYS` | `30` | the age reported on the dashboard |
 | `GIT_CLEANUP_ASSISTANT_NO_UPDATE_CHECK` | unset | set to `1` to skip the update check |
 | `GIT_CLEANUP_ASSISTANT_IGNORE_DIRTY` | unset | paths whose changes do not make a worktree dirty, see below |
+| `GIT_CLEANUP_ASSISTANT_MIN_IDLE_DAYS` | `7` | quiet period for `--apply-merged`, see below |
 | `GIT_CLEANUP_ASSISTANT_PREVIEW_LIMIT` | `12` | lines per group in `--plan` and `--apply-merged` output |
 
 ## Unattended runs
@@ -277,6 +278,7 @@ git-cleanup-assistant --apply-merged --base-ref origin/main
 | `--apply-merged` | removes the worktrees of the plan's *merged* group and nothing else; everything it keeps is listed with the reason |
 | `--delete-branches` | with `--apply-merged` only: also deletes merged local branches that no worktree holds any more. Off by default |
 | `--base-ref REF` | measures merge state against `REF`; wins over `GIT_CLEANUP_ASSISTANT_BASE_REF`. Without either, the best candidate is taken |
+| `--min-idle-days N` | leaves merged worktrees alone whose `HEAD` moved in the last `N` days. Default `7`, `0` turns it off |
 | `-h`, `--help` | usage |
 | `--version` | prints the version |
 
@@ -286,6 +288,13 @@ git-cleanup-assistant --apply-merged --base-ref origin/main
   a squash merge, or a merged pull request found through `gh`
 - it is clean, checked again right before the removal
 - it is not the primary worktree, not locked, and does not hold a protected branch
+- its `HEAD` has not moved for `--min-idle-days` days, read from the worktree's reflog
+
+The last rule exists because a worktree created a minute ago for work that has not started
+yet sits on the base ref: ancestry calls it merged, and it is clean. Both are true, and the
+removal would still pull it out from under whoever just created it. The quiet period is
+also read from `GIT_CLEANUP_ASSISTANT_MIN_IDLE_DAYS` or `git config
+cleanup-assistant.min-idle-days`, the flag winning over both.
 
 *Unclear* and *abandoned* stay, because both need a decision and there is nobody to make
 it; so do dirty and locked worktrees. Neither mode fetches: run `git fetch --prune` first,

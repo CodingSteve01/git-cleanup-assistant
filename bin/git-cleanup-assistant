@@ -61,6 +61,14 @@ MODE="interactive"
 NONINTERACTIVE=false
 DELETE_BRANCHES=false
 CLI_BASE_REF=""
+CLI_MIN_IDLE_DAYS=""
+
+#
+# How many days a merged worktree has to sit untouched before --apply-merged
+# removes it. See split_recent_worktrees.
+#
+DEFAULT_MIN_IDLE_DAYS=7
+MIN_IDLE_DAYS="$DEFAULT_MIN_IDLE_DAYS"
 
 #
 # Paths whose changes do not make a worktree dirty, one per line. Empty unless
@@ -3674,6 +3682,8 @@ Without flags, starts the interactive assistant.
   --delete-branches  with --apply-merged: also delete local branches that are
                      merged and no longer held by a worktree
   --base-ref REF     measure merge state against REF instead of choosing one
+  --min-idle-days N  with --apply-merged: leave merged worktrees alone whose HEAD
+                     moved in the last N days (default $DEFAULT_MIN_IDLE_DAYS, 0 turns it off)
   -h, --help         show this help
   --version          print the version
 
@@ -3703,6 +3713,17 @@ parse_arguments() {
                 [[ "$#" -ge 2 && -n "$2" ]] || usage_error "--base-ref needs a ref."
                 CLI_BASE_REF="$2"
                 shift
+                ;;
+            --min-idle-days)
+                [[ "$#" -ge 2 && "$2" =~ ^[0-9]+$ ]] ||
+                    usage_error "--min-idle-days needs a number of days."
+                CLI_MIN_IDLE_DAYS="$2"
+                shift
+                ;;
+            --min-idle-days=*)
+                CLI_MIN_IDLE_DAYS="${1#--min-idle-days=}"
+                [[ "$CLI_MIN_IDLE_DAYS" =~ ^[0-9]+$ ]] ||
+                    usage_error "--min-idle-days needs a number of days."
                 ;;
             --base-ref=*)
                 CLI_BASE_REF="${1#--base-ref=}"
@@ -3829,6 +3850,95 @@ worktree_restore_command() {
 }
 
 #
+# The flag wins over the environment, the environment over `git config`.
+#
+resolve_min_idle_days() {
+    local wanted="$CLI_MIN_IDLE_DAYS"
+
+    [[ -z "$wanted" ]] && wanted="${GIT_CLEANUP_ASSISTANT_MIN_IDLE_DAYS:-}"
+    [[ -z "$wanted" ]] &&
+        wanted="$(git config --get cleanup-assistant.min-idle-days 2>/dev/null || true)"
+
+    if [[ -z "$wanted" ]]; then
+        MIN_IDLE_DAYS="$DEFAULT_MIN_IDLE_DAYS"
+    elif [[ "$wanted" =~ ^[0-9]+$ ]]; then
+        MIN_IDLE_DAYS="$wanted"
+    else
+        die "Minimum idle days '$wanted' is not a number; nothing was changed."
+    fi
+}
+
+#
+# When the worktree's HEAD last moved: a checkout, a commit, a reset, and the
+# creation of the worktree itself. Read from its reflog, which a status call
+# does not touch; the commit date stands in when there is no reflog.
+#
+worktree_last_activity() {
+    local id="$1"
+
+    local selector
+    local epoch
+
+    selector="$(
+        git -C "$(worktree_field "$id" 2)" log -g -1 --date=unix --format=%gd HEAD \
+            2>/dev/null
+    )"
+
+    epoch="${selector##*\{}"
+    epoch="${epoch%\}}"
+
+    if ! [[ "$epoch" =~ ^[0-9]+$ ]]; then
+        epoch="$(worktree_field "$id" 11)"
+    fi
+
+    echo "${epoch:-0}"
+}
+
+#
+# Moves the merged worktrees whose HEAD moved in the last MIN_IDLE_DAYS out of
+# the group --apply-merged removes.
+#
+# A worktree created a minute ago for work that has not started yet sits on the
+# base ref, so ancestry calls it merged, and it is clean. Both are true and the
+# removal would still pull it out from under whoever just created it. Nobody is
+# there to say so on an unattended run, so a quiet period says it instead.
+#
+WT_PLAN_RECENT="$TMP_ROOT/wt-plan-recent.txt"
+WT_ROWS_RECENT="$TMP_ROOT/wt-rows-recent.txt"
+
+split_recent_worktrees() {
+    local eligible="$TMP_ROOT/wt-plan-eligible.txt"
+
+    : > "$eligible"
+    : > "$WT_PLAN_RECENT"
+
+    local id
+    local idle
+
+    load_ids "$(cat "$WT_PLAN_PROVEN")"
+
+    for id in ${SELECTED_IDS[@]+"${SELECTED_IDS[@]}"}; do
+        idle=$(( (NOW_EPOCH - $(worktree_last_activity "$id")) / 86400 ))
+
+        if [[ "$MIN_IDLE_DAYS" -gt 0 && "$idle" -lt "$MIN_IDLE_DAYS" ]]; then
+            echo "$id" >> "$WT_PLAN_RECENT"
+        else
+            echo "$id" >> "$eligible"
+        fi
+    done
+
+    cat "$eligible" > "$WT_PLAN_PROVEN"
+
+    write_worktree_rows "$(cat "$WT_PLAN_PROVEN")" "$WT_ROWS_PROVEN"
+    write_worktree_rows "$(cat "$WT_PLAN_RECENT")" "$WT_ROWS_RECENT"
+}
+
+print_recent_worktrees() {
+    print_plan_group "$CYAN" "merged, but used recently" "$WT_ROWS_RECENT" \
+        "HEAD moved in the last $MIN_IDLE_DAYS day(s); removed once it has been idle that long"
+}
+
+#
 # Removes the plan's "merged" group and nothing else.
 #
 # The group is already free of the primary worktree, of dirty and locked
@@ -3848,7 +3958,7 @@ apply_merged_worktrees() {
     title "Removing merged worktrees"
 
     if [[ "$candidates" -eq 0 ]]; then
-        info "None of the $total worktrees is both merged and clean."
+        info "None of the $total worktrees is merged, clean and idle for $MIN_IDLE_DAYS day(s)."
     fi
 
     local removed=0
@@ -3908,6 +4018,8 @@ apply_merged_worktrees() {
     # Every kept worktree is named with its reason, so a run that removed
     # nothing says why rather than only that.
     #
+    print_recent_worktrees
+
     print_plan_group "$CYAN" "dirty or locked" "$WT_ROWS_HELD" \
         "never removed unattended, whatever the evidence says"
 
@@ -3984,6 +4096,7 @@ print_non_interactive_header() {
     echo "Repository:     $REPO_ROOT"
     echo "Primary branch: ${PRIMARY_BRANCH:-(detached)}"
     echo "Base ref:       $BASE_REF"
+    echo "Minimum idle:   $MIN_IDLE_DAYS day(s)"
 
     if [[ "$GH_AVAILABLE" == true && -n "$REPO_SLUG" ]]; then
         echo "GitHub:         $REPO_SLUG"
@@ -4005,6 +4118,7 @@ run_non_interactive() {
     detect_github_non_interactively
     initialize_repository
     choose_base_ref_non_interactively
+    resolve_min_idle_days
 
     MENU_HEIGHT="$DEFAULT_HEIGHT"
     LIST_HEIGHT="$DEFAULT_HEIGHT"
@@ -4042,11 +4156,20 @@ run_non_interactive() {
         fi
         print_branch_plan
 
-        echo
-        info "With --apply-merged: $(count_rows "$WT_PLAN_PROVEN") of $(count_rows "$WORKTREE_DATA") worktrees would be removed (merged and clean)."
+        #
+        # Split only now, so the plan above is the one the interactive
+        # assistant shows, and this part says what the unattended run adds.
+        #
+        split_recent_worktrees
+
+        title "With --apply-merged"
+        print_recent_worktrees
+        info "$(count_rows "$WT_PLAN_PROVEN") of $(count_rows "$WORKTREE_DATA") worktrees would be removed (merged, clean, idle for $MIN_IDLE_DAYS day(s))."
         info "Branches are only deleted with --delete-branches. Nothing was changed."
         return 0
     fi
+
+    split_recent_worktrees
 
     print_non_interactive_header "apply merged"
 
